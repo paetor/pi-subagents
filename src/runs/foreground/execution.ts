@@ -8,6 +8,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import { discoverAgents, formatUnknownAgentError, unknownAgentDiagnosticContext, type AgentConfig } from "../../agents/agents.ts";
 import { alignForkedSessionCwd } from "../../shared/fork-session-cwd.ts";
 import { buildEffectiveSystemPrompt } from "../shared/effective-system-prompt.ts";
+import { captureCredentialContext } from "../shared/credential-context.ts";
 import {
 	ensureArtifactsDir,
 	formatOutputArtifactContent,
@@ -432,6 +433,9 @@ async function runSingleAttempt(
 		inherited: options.childRuntime,
 		host: "parent",
 	});
+	const credentialContext = options.credentialContext ?? captureCredentialContext(options.parentProviderRegistry);
+	if (credentialContext?.length && options.machine) throw new Error("Host-local account bindings cannot be forwarded to a remote machine.");
+	launch.session.credentialContext = credentialContext;
 	if (!options.machine && options.parentProviderRegistry) launch.session.parentProviderRegistry = options.parentProviderRegistry;
 	const { toolPlan, capabilityAudit, warnings, launchResolvedExtensions, capture } = launch;
 	if (!shared.launchWarnings.emitted && warnings.length > 0) {

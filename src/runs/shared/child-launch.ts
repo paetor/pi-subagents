@@ -62,6 +62,7 @@ export function inheritedChildRuntime(config: ChildRuntimeConfig | undefined): I
 }
 
 export interface BuildInProcessChildLaunchInput {
+	credentialContext?: import("./credential-context.ts").CredentialContext[];
 	machine?: HerdrMachineReference;
 	remoteSkillNames?: string[];
 	remoteReads?: string[] | false;
@@ -326,6 +327,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		cwd: input.cwd,
 		...(input.machine ? { machine: input.machine } : {}),
 		...(input.projectTrusted !== undefined ? { projectTrusted: input.projectTrusted } : {}),
+		...(input.credentialContext?.length ? { credentialContext: input.credentialContext } : {}),
 		...(input.machine ? { remoteResources: { agent: input.childAgentName, ...(input.remoteSkillNames ? { skills: input.remoteSkillNames } : {}), ...(input.remoteReads !== undefined ? { reads: input.remoteReads } : {}), ...(toolPlan.explicitToolAllowlist ? { toolCeiling: [...toolPlan.effectiveToolAllowlist] } : toolPlan.capabilityCeiling?.allowedTools ? { toolCeiling: [...toolPlan.capabilityCeiling.allowedTools] } : {}) } } : {}),
 		storage: childStorage(input),
 		...(input.model ? { model: input.model } : {}),

@@ -2464,6 +2464,8 @@ export interface RunSyncOptions {
 	childSessionFactory?: import("../runs/shared/child-session.ts").ChildSessionFactory;
 	/** Invoking parent registry inherited only by its local foreground launch. */
 	parentProviderRegistry?: import("../runs/shared/child-session.ts").ParentProviderRegistry;
+	/** Non-secret account binding captured by the owning runner. */
+	credentialContext?: import("../runs/shared/credential-context.ts").CredentialContext[];
 	/** The invoking session's project trust; undefined when the host has no trust concept. */
 	projectTrusted?: boolean;
 	/** The launching executor's own child runtime when it is itself an in-process child. */

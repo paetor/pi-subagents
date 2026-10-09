@@ -70,6 +70,7 @@ import {
 } from "../../shared/types.ts";
 import { inheritedNestedParentAddressOf, inheritedNestedRouteOf, nestedResultsPath, nestedSummaryFromAsyncStatus, writeNestedEvent } from "../shared/nested-events.ts";
 import { SUBAGENT_PARENT_SESSION_ENV, type ChildRuntimeConfig } from "../shared/child-runtime-config.ts";
+import { captureCredentialContext } from "../shared/credential-context.ts";
 import { childSessionFactoryModule } from "../shared/child-session.ts";
 import { inheritedChildRuntime } from "../shared/child-launch.ts";
 import { resultFilePath } from "./result-files.ts";
@@ -169,6 +170,7 @@ function supportsNativeRunner(nodeExecutable: string): boolean {
 
 interface AsyncExecutionContext {
 	pi: ExtensionAPI;
+	parentProviderRegistry?: import("../shared/credential-context.ts").CredentialContextRegistry;
 	cwd: string;
 	currentSessionId: string;
 	completionOwnerId?: string;
@@ -1533,6 +1535,7 @@ export function executeAsyncChain(
 			{
 				id,
 				steps,
+				credentialContext: captureCredentialContext(ctx.parentProviderRegistry),
 				resultPath: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : resultFilePath(DIRS.results, id),
 				cwd: runnerCwd,
 				placeholder: "{previous}",
@@ -2101,6 +2104,7 @@ export function executeAsyncSingle(
 		spawnResultOrPromise = spawnRunner(
 			{
 				id,
+				credentialContext: captureCredentialContext(ctx.parentProviderRegistry),
 				steps: [
 					{
 						parentSessionId: launchParentSessionId,

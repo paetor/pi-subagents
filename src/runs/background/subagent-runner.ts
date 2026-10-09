@@ -170,6 +170,7 @@ process.env[SUBAGENT_CHILD_ENV] = "1";
 
 export interface SubagentRunConfig {
 	id: string;
+	credentialContext?: import("../shared/credential-context.ts").CredentialContext[];
 	steps: RunnerStep[];
 	resultPath: string;
 	cwd: string;
@@ -655,6 +656,7 @@ async function readGitFingerprint(cwd: string, signal: AbortSignal, onError: (er
 
 /** Context for running a single step */
 interface SingleStepContext {
+	credentialContext?: import("../shared/credential-context.ts").CredentialContext[];
 	previousOutput: string;
 	outputs?: ChainOutputMap;
 	placeholder: string;
@@ -3744,6 +3746,7 @@ export async function runSubagent(
 					flatIndex: fi, flatStepCount: Math.max(statusPayload.steps.length, 1),
 					outputFile: path.join(asyncDir, `output-${fi}.log`),
 					projectTrusted: config.projectTrusted,
+					credentialContext: config.credentialContext,
 					piPackageRoot: config.piPackageRoot,
 					childSessions,
 					inheritedChildRuntime: config.inheritedChildRuntime,
@@ -4159,6 +4162,7 @@ export async function runSubagent(
 							artifactsDir, artifactConfig, id,
 							flatIndex: fi, flatStepCount: Math.max(statusPayload.steps.length, 1),
 							projectTrusted: config.projectTrusted,
+							credentialContext: config.credentialContext,
 							outputFile: path.join(asyncDir, `output-${fi}.log`),
 							piPackageRoot: config.piPackageRoot,
 							childSessions,
@@ -4550,6 +4554,7 @@ export async function runSubagent(
 				sessionDir: config.sessionDir,
 				artifactsDir, artifactConfig, id,
 				projectTrusted: config.projectTrusted,
+				credentialContext: config.credentialContext,
 				flatIndex, flatStepCount: Math.max(statusPayload.steps.length, 1),
 				outputFile: path.join(asyncDir, `output-${flatIndex}.log`),
 				piPackageRoot: config.piPackageRoot,

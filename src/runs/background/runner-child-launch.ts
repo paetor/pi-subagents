@@ -8,6 +8,7 @@ import { formatAcceptancePrompt } from "../shared/acceptance.ts";
 import { isAgentContract } from "../shared/agent-contract.ts";
 
 export interface RunnerChildLaunchContext {
+	credentialContext?: import("../shared/credential-context.ts").CredentialContext[];
 	cwd: string;
 	id: string;
 	flatIndex: number;
@@ -34,7 +35,9 @@ export function buildRunnerChildLaunch(step: RunnerSubagentStep, ctx: RunnerChil
 	const acceptancePrompt = step.effectiveAcceptance
 		? formatAcceptancePrompt(step.effectiveAcceptance, { reportOptional: isAgentContract(step.agentContract), structuredOutput: Boolean(step.structuredOutput?.acceptanceReportPath) })
 		: "";
+	if (ctx.credentialContext?.length && step.machine) throw new Error("Host-local account bindings cannot be forwarded to a remote machine.");
 	return buildInProcessChildLaunch({
+		credentialContext: ctx.credentialContext,
 		machine: step.machine,
 		remoteSkillNames: step.skills,
 		remoteReads: step.remoteReads,

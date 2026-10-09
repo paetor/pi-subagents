@@ -19,6 +19,7 @@ import { getAgentDir, PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../shared/util
 import { resolvePackageSubpath } from "../background/runner-aliases.ts";
 import { PI_CODING_AGENT_PACKAGE, resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "./pi-spawn.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
+import { applyCredentialContext, type CredentialContext } from "./credential-context.ts";
 import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import type { HerdrMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
 
@@ -61,6 +62,8 @@ export interface ChildSessionLaunch {
 	projectTrusted?: boolean;
 	/** Process-local provider source owned by the invoking foreground parent. */
 	parentProviderRegistry?: ParentProviderRegistry;
+	/** Captured host-local auth binding, separate from extension/tool grants. */
+	credentialContext?: CredentialContext[];
 	/** Logical names resolved only by the remote ambient package. */
 	remoteResources?: { agent: string; skills?: string[]; toolCeiling?: string[]; reads?: string[] | false };
 	storage: ChildSessionStorage;
@@ -423,7 +426,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			const pi = await loadPiCodingAgent();
 			const builtinMcpTools = launch.builtinMcpTools ?? [];
 			const builtinMcp = builtinMcpTools.length ? selectedBuiltinMcpExtension(pi, builtinMcpTools) : undefined;
-			const modelRuntime = launch.parentProviderRegistry
+			const modelRuntime = launch.parentProviderRegistry || launch.credentialContext?.length || launch.storage.kind === "file"
 				? await pi.ModelRuntime.create()
 				: await sharedRuntime(pi);
 			const agentDir = getAgentDir();
@@ -512,6 +515,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 						: launch.storage.kind === "memory"
 							? pi.SessionManager.inMemory(launch.cwd)
 							: pi.SessionManager.create(launch.cwd);
+				await applyCredentialContext(modelRuntime, sessionManager, launch.credentialContext);
 				const resolvedModel = launch.model
 					? pi.resolveCliModel({ cliModel: launch.model, modelRuntime })
 					: undefined;
