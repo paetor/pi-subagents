@@ -11,6 +11,8 @@
 
 ### Changed
 
+- The `bg_wait` tool's description and parameter descriptions took about 4,500 characters on every model request, and each of its five parameters repeated that ordinary async runs already wake the session. They now take about 1,100 characters: the tool description says it once and lists the call shapes, and each parameter has a short label. ([#2769](https://github.com/nicobailon/pi-subagents/issues/2769))
+
 - Each message pi-subagents put in the main chat had its own look: bordered cards for supervisor requests, replies, and attention notices, `✓`/`✗` lines for completions, plain colored lines for steering, and Pi's default block with raw type labels such as `[subagent-wait-subscription]` for reminders and wakes. They now all use Pi's own message block, the one behind `[skill]`: a single `[subagent]` line whose label color names the kind (supervisor ask or attention, reply, result, or watchdog) and whose status word takes the theme's status color. A click opens one block and Pi's expand key opens them all, showing the text the main agent read. Thanks to [@pwguler](https://github.com/pwguler) for [#2753](https://github.com/nicobailon/pi-subagents/pull/2753).
 - Subagent model displays (Fleet, the async widget, run status, nested renders and result cards) showed only the model id, so two providers or logins serving the same model looked identical. They now show `provider/model`. Thanks to [@IdrisGit](https://github.com/IdrisGit) for [#2734](https://github.com/nicobailon/pi-subagents/pull/2734).
 
