@@ -1,0 +1,58 @@
+name: Fork CI
+
+on:
+  push:
+    branches: [account-routing, 'fork-ci/**', 'integration/**']
+  pull_request:
+    branches: [account-routing]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  public-ci:
+    if: github.repository == 'paetor/pi-subagents'
+    name: public-ci (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Runner prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep fd-find tmux
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+      - name: Runner prerequisites on macOS
+        if: runner.os == 'macOS'
+        run: |
+          for tool in rg fd tmux; do
+            if ! command -v "$tool" >/dev/null; then
+              case "$tool" in rg) brew install ripgrep ;; *) brew install "$tool" ;; esac
+            fi
+          done
+      - name: Run fork checks
+        run: node scripts/fork-maintenance.mjs ci
+      - name: Save public CI evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fork-ci-${{ matrix.os }}-${{ github.run_attempt }}
+          path: .fork-ci/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

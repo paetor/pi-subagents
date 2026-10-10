@@ -103,7 +103,9 @@ describe("watchdog LSP diagnostics", () => {
 				fs.writeFileSync(path.join(binDir, "typescript-language-server.cmd"), `@echo off\r\n"${process.execPath}" "%~dp0\\tls-malformed.js" %*\r\n`, "utf-8");
 			} else {
 				const commandPath = path.join(binDir, "typescript-language-server");
-				fs.writeFileSync(commandPath, `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/tls-malformed.js" "$@"\n`, { encoding: "utf-8", mode: 0o755 });
+				// Test malformed framing, not whether a second cold Node process starts
+				// inside 500ms under full-suite load. Keep the real subprocess and deadline.
+				fs.writeFileSync(commandPath, "#!/bin/sh\nIFS= read -r header\nprintf 'Content-Length: 8\\r\\n\\r\\nnot-json'\nwhile IFS= read -r line; do :; done\n", { encoding: "utf-8", mode: 0o755 });
 			}
 
 			const diagnostics = await collectWatchdogLspDiagnostics({

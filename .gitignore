@@ -19,3 +19,6 @@ tmp/
 /perf-*.md
 /pr-*-gate*.json
 /pr-*-review*.md
+
+# Owned public CI diagnostics, never source or credentials.
+.fork-ci/
