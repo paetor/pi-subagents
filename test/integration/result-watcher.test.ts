@@ -75,7 +75,12 @@ describe("result watcher", () => {
 		const state = createState();
 		state.currentSessionId = "session-1";
 		const delivered: unknown[] = [], completed: unknown[] = [];
+		let watchEvent: ((event: string, file: string) => void) | undefined;
+		const nativeWatcher = { on() { return nativeWatcher; }, close() {}, unref() {} } as unknown as fs.FSWatcher;
 		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event, value) { if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) completed.push(value); } } }, state, resultsDir, 60_000, {
+			// This helper selects the Linux route, even on Darwin. Deliver its event
+			// explicitly: receipt semantics must not depend on FSEvents startup timing.
+			fs: { ...fs, watch: ((_directory: fs.PathLike, listener: (event: string, file: string) => void) => { watchEvent = listener; return nativeWatcher; }) as typeof fs.watch },
 			notifier: { async deliver(value) { delivered.push(value); return true; } },
 		});
 		try {
@@ -83,7 +88,10 @@ describe("result watcher", () => {
 			writeIndexedResult(path.join(resultsDir, "dispatch.json"), { id: "dispatch", runId: "dispatch", mode: "workflow", state: "complete", success: true, sessionId: "session-1",
 				results: [{ workflowKey: "child", runId: "child-run", state: "running", output: "", outputState: "absent" }],
 			});
+			assert.ok(watchEvent);
+			watchEvent("rename", "dispatch.json");
 			assert.equal(await waitForPredicate(() => completed.length === 1), true);
+			assert.equal(delivered.length, 1);
 			for (const value of [...delivered, ...completed]) {
 				assert.equal(value.results[0].status, "running");
 				assert.equal(value.results[0].success, undefined);
