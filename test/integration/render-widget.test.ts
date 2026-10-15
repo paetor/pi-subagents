@@ -1597,9 +1597,8 @@ describe("subagent async widget rendering", () => {
 		], theme, 180);
 
 		const text = lines.join("\n");
-		assert.match(text, /reviewer · running \(gpt-5\.5 · thinking high\)/);
-		assert.match(text, /scout · running \(claude-haiku-4-5 · thinking low\)/);
-		assert.doesNotMatch(text, /openai-codex\/gpt-5\.5/);
+		assert.match(text, /reviewer · running \(openai-codex\/gpt-5\.5 · thinking high\)/);
+		assert.match(text, /scout · running \(anthropic\/claude-haiku-4-5 · thinking low\)/);
 		assert.doesNotMatch(text, /gpt-5\.5:high/);
 	});
 

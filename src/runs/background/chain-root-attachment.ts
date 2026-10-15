@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { resultFilePath, resultPayloadPathForSessionRun } from "./result-files.ts";
 import type { AcceptanceLedger, ArtifactPaths, AsyncStatus, CostSummary, EffectsProjection, ExecutionProjection, Usage } from "../../shared/types.ts";
-import { readStatus } from "../../shared/utils.ts";
+import { SUBAGENT_STOPPED_MESSAGE, SUBAGENT_TIMED_OUT_MESSAGE, readStatus } from "../../shared/utils.ts";
 
 export interface ImportedAsyncRoot {
 	runId: string;
@@ -13,7 +13,8 @@ export interface ImportedAsyncRoot {
 
 export interface ImportedAsyncRootResult {
 	agent: string;
-	importedPublication?: { sessionId?: string; toolCallId?: string };
+	/** `snapshot` is the payload text this result was built from, so cleanup can tell it from a newer one. */
+	importedPublication?: { sessionId?: string; toolCallId?: string; snapshot: string };
 	/** Human-readable display name for the child session, when derived at launch. */
 	sessionName?: string;
 	output: string;
@@ -83,18 +84,20 @@ interface AsyncResultFile {
 const TERMINAL_STATES = new Set(["complete", "failed", "partial", "paused", "stopped"]);
 const TERMINAL_STEP_STATUSES = new Set(["complete", "completed", "failed", "partial", "paused", "stopped"]);
 
-function readResultFile(resultPath: string): AsyncResultFile | undefined {
+function readResultFile(resultPath: string): { data: AsyncResultFile; raw: string } | undefined {
+	let raw: string;
 	try {
-		return JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultFile;
+		raw = fs.readFileSync(resultPath, "utf-8");
 	} catch (error) {
 		if (typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") {
 			return undefined;
 		}
 		throw error;
 	}
+	return { data: JSON.parse(raw) as AsyncResultFile, raw };
 }
 
-function readImportedResultFile(root: ImportedAsyncRoot, status: AsyncStatus | null): AsyncResultFile | undefined {
+function readImportedResultFile(root: ImportedAsyncRoot, status: AsyncStatus | null): { data: AsyncResultFile; raw: string } | undefined {
 	const direct = readResultFile(root.resultPath);
 	if (direct || !status?.sessionId) return direct;
 	const indexedPath = resultPayloadPathForSessionRun(path.dirname(root.resultPath), status.sessionId, root.runId);
@@ -132,7 +135,7 @@ function outputFromTerminalStatus(root: ImportedAsyncRoot, status: AsyncStatus, 
 	const agent = step?.agent ?? status.steps?.[root.index]?.agent ?? "subagent";
 	const timedOut = step?.timedOut === true || status.timedOut === true;
 	const stopped = step?.stopped === true || status.stopped === true || status.state === "stopped";
-	const message = step?.error ?? status.error ?? (stopped ? "Subagent stopped by user." : `Attached async root ${root.runId} ended without a result file at ${root.resultPath}.`);
+	const message = step?.error ?? status.error ?? (stopped ? SUBAGENT_STOPPED_MESSAGE : `Attached async root ${root.runId} ended without a result file at ${root.resultPath}.`);
 	const partialStatus = status.state === "partial" || step?.status === "partial";
 	const execution = step?.execution ?? (partialStatus
 		? { status: "partial" as const, success: false, exitCode: 1, error: message }
@@ -180,7 +183,7 @@ function outputFromTimeout(root: ImportedAsyncRoot, status: AsyncStatus | null, 
 	};
 }
 
-function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null, result: AsyncResultFile): ImportedAsyncRootResult {
+function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null, { data: result, raw }: { data: AsyncResultFile; raw: string }): ImportedAsyncRootResult {
 	const child = result.results?.[root.index];
 	const step = selectedStatusStep(status, root.index);
 	const state = resultState(result, child);
@@ -189,7 +192,7 @@ function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null
 	const timedOut = child?.timedOut === true || step?.timedOut === true || result.timedOut === true || status?.timedOut === true;
 	const stopped = child?.stopped === true || step?.stopped === true || result.stopped === true || status?.stopped === true || state === "stopped";
 	const success = state === "complete" && !timedOut && !stopped;
-	const error = child?.error ?? (success ? undefined : stopped ? "Subagent stopped by user." : result.error ?? result.summary ?? status?.error ?? `Attached async root ${root.runId} did not complete successfully.`);
+	const error = child?.error ?? (success ? undefined : stopped ? SUBAGENT_STOPPED_MESSAGE : result.error ?? result.summary ?? status?.error ?? `Attached async root ${root.runId} did not complete successfully.`);
 	const execution = state ? { status: state === "complete" ? "completed" as const : state, success, exitCode: success ? 0 : 1, ...(error ? { error } : {}) } : undefined;
 	const usage = child?.usage;
 	return {
@@ -197,6 +200,7 @@ function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null
 		importedPublication: {
 			...(typeof result.sessionId === "string" ? { sessionId: result.sessionId } : {}),
 			...(typeof result.toolCallId === "string" ? { toolCallId: result.toolCallId } : {}),
+			snapshot: raw,
 		},
 		output: success ? output : (output || error || ""),
 		success,
@@ -236,7 +240,7 @@ export async function waitForImportedAsyncRoot(
 	let terminalSince: number | undefined;
 	for (;;) {
 		const status = readStatus(root.asyncDir);
-		if (options.shouldAbort?.()) return outputFromTimeout(root, status, options.timeoutMessage ?? "Subagent timed out.", options.abortedAsStopped === true);
+		if (options.shouldAbort?.()) return outputFromTimeout(root, status, options.timeoutMessage ?? SUBAGENT_TIMED_OUT_MESSAGE, options.abortedAsStopped === true);
 		const result = readImportedResultFile(root, status);
 		if (result) return buildImportedResult(root, status, result);
 		if (isTerminalStatus(status, root.index)) {

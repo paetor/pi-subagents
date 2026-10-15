@@ -18,6 +18,7 @@ import {
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { findModelInfo, toModelInfo } from "../shared/model-info.ts";
 import { shortenPath } from "../shared/formatters.ts";
+import { canRenderComponents } from "../shared/extension-context.ts";
 import { listAsyncRuns, formatAsyncRunProgressLabel, type AsyncRunSummary } from "../runs/background/async-status.ts";
 import { encodeInspectReply, handleInspectRpcArgs, INSPECT_WIDGET_KEY } from "../runs/background/inspect-rpc.ts";
 import { listScheduledRunSummaries } from "../runs/background/scheduled-runs.ts";
@@ -172,7 +173,9 @@ type StopSelectorTarget = {
 	actionLabel: string;
 };
 
-type StopSelectorResult = { confirmed: boolean; target?: StopSelectorTarget };
+type StopAllTarget = Omit<StopSelectorTarget, "kind" | "id"> & { kind: "all"; ids: string[] };
+type StopPickerTarget = StopSelectorTarget | StopAllTarget;
+type StopSelectorResult = { confirmed: boolean; target?: StopPickerTarget };
 
 function commandForTarget(target: StopSelectorTarget): string {
 	return target.kind === "scheduled"
@@ -230,6 +233,12 @@ function stopFallbackText(targets: StopSelectorTarget[]): string {
 	return lines.join("\n");
 }
 
+function stopPickerTargets(targets: StopSelectorTarget[]): StopPickerTarget[] {
+	const ids = targets.filter((target) => target.kind === "async").map((target) => target.id);
+	if (ids.length < 2) return targets;
+	return [{ kind: "all", ids, label: `${ids.length} async runs`, detail: ids.join(", "), actionLabel: "stop all" }, ...targets];
+}
+
 function selectForegroundDetachControl(state: SubagentState, requested: string) {
 	const controls = [...state.foregroundControls.values()];
 	if (requested) {
@@ -251,10 +260,10 @@ class SubagentsStopSelector implements Component {
 	private confirming = false;
 	private readonly tui: TUI;
 	private readonly theme: Theme;
-	private readonly targets: StopSelectorTarget[];
+	private readonly targets: StopPickerTarget[];
 	private readonly done: (result: StopSelectorResult) => void;
 
-	constructor(tui: TUI, theme: Theme, targets: StopSelectorTarget[], done: (result: StopSelectorResult) => void) {
+	constructor(tui: TUI, theme: Theme, targets: StopPickerTarget[], done: (result: StopSelectorResult) => void) {
 		this.tui = tui;
 		this.theme = theme;
 		this.targets = targets;
@@ -304,9 +313,8 @@ class SubagentsStopSelector implements Component {
 			const target = this.targets[index]!;
 			const selected = index === this.selected;
 			const marker = selected ? "›" : " ";
-				const actionLabel = target.actionLabel;
-			const action = target.kind === "scheduled" ? this.theme.fg("warning", actionLabel) : this.theme.fg("accent", actionLabel);
-			const labelWidth = Math.max(0, contentWidth - marker.length - actionLabel.length - 2);
+			const action = target.kind === "scheduled" ? this.theme.fg("warning", target.actionLabel) : this.theme.fg("accent", target.actionLabel);
+			const labelWidth = Math.max(0, contentWidth - marker.length - target.actionLabel.length - 2);
 			lines.push(`${marker} ${action} ${target.label.slice(0, labelWidth)}`);
 			if (selected) lines.push(this.theme.fg("dim", `  ${target.detail}`.slice(0, contentWidth)));
 		}
@@ -314,8 +322,8 @@ class SubagentsStopSelector implements Component {
 		lines.push("");
 		if (this.confirming) {
 			const target = this.targets[this.selected]!;
-			lines.push(this.theme.fg("warning", `Confirm: ${target.actionLabel} ${target.id}?`));
-			if (target.kind === "async") lines.push(this.theme.fg("dim", "Stop ends this run; use interrupt for a resumable pause."));
+			lines.push(this.theme.fg("warning", `Confirm: ${target.actionLabel} ${target.kind === "all" ? target.label : target.id}?`));
+			if (target.kind !== "scheduled") lines.push(this.theme.fg("dim", target.kind === "all" ? "Stop ends these runs; scheduled runs are not paused." : "Stop ends this run; use interrupt for a resumable pause."));
 			lines.push(this.theme.fg("dim", "Enter/Y confirms · N returns · Esc cancels"));
 		} else {
 			lines.push(this.theme.fg("dim", "↑↓/jk select · Enter confirm · Esc cancel"));
@@ -620,7 +628,7 @@ export function registerSlashCommands(
 	};
 	const showFleet = async (ctx: ExtensionContext) => {
 		state.lastUiContext = ctx;
-		if (!ctx.hasUI) {
+		if (!canRenderComponents(ctx)) {
 			await runCommand(ctx, { action: "status", view: "fleet" });
 			return;
 		}
@@ -700,7 +708,7 @@ export function registerSlashCommands(
 		description: "Host integration bridge: answer an async child inspection request with a correlated widget payload (no model turn)",
 		handler: async (args, ctx) => {
 			if (ctx.mode === "tui") {
-				ctx.ui.notify("Inspection replies are emitted only on RPC surfaces. Use /subagents or subagent({ action: \"status\", view: \"transcript\" }) interactively.", "info");
+				ctx.ui.notify("Inspection replies are emitted only on RPC surfaces. Use /subagents or subagent({ action: \"status\", options: { view: \"transcript\" } }) interactively.", "info");
 				return;
 			}
 			if (!ctx.hasUI) return;
@@ -803,7 +811,7 @@ export function registerSlashCommands(
 				ctx.ui.notify(message, "error");
 				return;
 			}
-			if (!ctx.hasUI) {
+			if (!canRenderComponents(ctx)) {
 				sendSlashText(pi, stopFallbackText(targets));
 				return;
 			}
@@ -813,10 +821,14 @@ export function registerSlashCommands(
 			}
 
 			const result = await ctx.ui.custom<StopSelectorResult>(
-				(tui, theme, _kb, done) => new SubagentsStopSelector(tui, theme, targets, done),
+				(tui, theme, _kb, done) => new SubagentsStopSelector(tui, theme, stopPickerTargets(targets), done),
 				{ overlay: true, overlayOptions: { anchor: "center", width: 88, maxHeight: "80%" } },
 			);
 			if (!result?.confirmed || !result.target) return;
+			if (result.target.kind === "all") {
+				for (const id of result.target.ids) await runCommand(ctx, { action: "stop", id });
+				return;
+			}
 			if (result.target.kind === "scheduled") {
 				await runCommand(ctx, { action: "schedule.pause", id: result.target.id });
 				return;

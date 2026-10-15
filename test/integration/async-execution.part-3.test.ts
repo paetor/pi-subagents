@@ -381,12 +381,11 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const call = await waitForMockPiCall(mockPi, 0);
 		const taskArg = call.args.at(-1) ?? "";
 		const systemPrompt = call.systemPrompts[0]?.text ?? "";
-		for (const instruction of [taskArg, systemPrompt]) {
-			assert.match(instruction, /Return the complete artifact in your final response\./);
-			assert.match(instruction, /runtime will persist it to exactly this path:/);
-			assert.match(instruction, /Do not call contact_supervisor merely because no write-capable tool is available\./);
-			assert.doesNotMatch(instruction, /Write your findings to exactly this path/);
-		}
+		assert.match(taskArg, /Return the complete artifact in your final response\./);
+		assert.match(taskArg, /runtime will persist it to exactly this path:/);
+		assert.match(taskArg, /Do not call contact_supervisor merely because no write-capable tool is available\./);
+		assert.doesNotMatch(taskArg, /Write your findings to exactly this path/);
+		assert.doesNotMatch(systemPrompt, /runtime will persist it to exactly this path:/);
 		const deadline = Date.now() + 10_000;
 		while (!fs.existsSync(resultPath)) {
 			if (Date.now() > deadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
@@ -473,7 +472,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(fs.existsSync(path.join(tempDir, "context.md")), false);
 	});
 
-	it("background single runs make output overrides authoritative in the child system prompt", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("background single runs deliver the output override in the task and keep it out of the child system prompt", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "async override report" });
 		const id = `async-output-override-system-prompt-${Date.now().toString(36)}`;
 		const outputPath = path.join(tempDir, "async-custom-report.md");
@@ -504,10 +503,9 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const taskArg = call.args.at(-1) ?? "";
 		const systemPrompt = call.systemPrompts[0]?.text ?? "";
 		assert.match(taskArg, new RegExp(`Write your findings to exactly this path: ${escapeRegExp(outputPath)}`));
+		assert.match(taskArg, /Ignore any other output filename or output path mentioned elsewhere/);
 		assert.match(systemPrompt, /Output format \(`default-report\.md`\):/);
-		assert.match(systemPrompt, /Runtime output path override:/);
-		assert.match(systemPrompt, new RegExp(`Write your findings to exactly this path: ${escapeRegExp(outputPath)}`));
-		assert.match(systemPrompt, /Ignore any other output filename or output path mentioned elsewhere/);
+		assert.doesNotMatch(systemPrompt, new RegExp(escapeRegExp(outputPath)));
 		await waitForAsyncResultFile(id);
 	});
 
@@ -809,8 +807,8 @@ export default function() {
 			jsonl: [
 				{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "structured-rejected", name: "structured_output", arguments: { value: {} } }], model: "mock/test-model", stopReason: "toolUse", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
 				{ type: "tool_execution_start", toolCallId: "structured-rejected", toolName: "structured_output", args: { value: {} } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "structured-rejected", toolName: "structured_output", isError: true, content: [{ type: "text", text: diagnostic }] } },
 				{ type: "tool_execution_end", toolCallId: "structured-rejected", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolCallId: "structured-rejected", toolName: "structured_output", isError: true, content: [{ type: "text", text: diagnostic }] } },
 			],
 		});
 		const id = `async-single-schema-rejected-${Date.now().toString(36)}`;
@@ -847,8 +845,8 @@ export default function() {
 		mockPi.onCall({
 			jsonl: [
 				{ type: "tool_execution_start", toolCallId: "structured-malformed-schema", toolName: "structured_output", args: { value: "value" } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "structured-malformed-schema", toolName: "structured_output", isError: true, content: [{ type: "text", text: `Structured output validation failed: ${validation.message}` }] } },
 				{ type: "tool_execution_end", toolCallId: "structured-malformed-schema", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolCallId: "structured-malformed-schema", toolName: "structured_output", isError: true, content: [{ type: "text", text: `Structured output validation failed: ${validation.message}` }] } },
 			],
 		});
 		const id = `async-single-malformed-schema-${Date.now().toString(36)}`;
@@ -1774,6 +1772,67 @@ syncBuiltinESMExports();
 		assert.equal((await readAsyncPayload(result.details.asyncId)).success, true);
 	});
 
+	it("writes an output-less resume next to the original run's saved output instead of over it", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		mockPi.onCall({ output: "Stage 1 report" });
+		const sourceId = `async-revive-output-${Date.now().toString(36)}`;
+		const sessionFile = path.join(tempDir, "sessions", "output.jsonl");
+		const report = path.join(tempDir, "reports", "lane-writer-report.md");
+		fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+		fs.writeFileSync(sessionFile, "", "utf-8");
+		executeAsyncSingle(sourceId, {
+			agent: "worker",
+			task: "Initial work",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-123" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			sessionFile,
+			output: report,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+		await readAsyncPayload(sourceId);
+		assert.match(fs.readFileSync(report, "utf-8"), /Stage 1 report/);
+
+		mockPi.onCall({ output: "Stage 2 report" });
+		const result = await makeAsyncExecutor([makeAgent("worker")]).execute(
+			"revive-output",
+			{ action: "resume", id: sourceId, message: "Continue", acceptance: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		) as AsyncExecutionResult;
+		assert.ok(!result.isError, result.content[0]?.text);
+		assert.ok(result.details.asyncId);
+		const revived = await readAsyncPayload(result.details.asyncId);
+		assert.match(fs.readFileSync(report, "utf-8"), /Stage 1 report/, "the original run's report must survive the resume");
+		const revivedReport = path.join(tempDir, "reports", `lane-writer-report.${result.details.asyncId.slice(0, 8)}.md`);
+		assert.match(fs.readFileSync(revivedReport, "utf-8"), /Stage 2 report/);
+		assert.ok(revived.results[0]?.output?.includes(`Output saved to: ${revivedReport}`), revived.results[0]?.output);
+	});
+
+	it("writes an output-less resume of a relative-output foreground run next to its saved report", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const executor = makeAsyncExecutor([makeAgent("worker")]);
+		mockPi.onCall({ output: "Stage 1 report" });
+		const first = await executor.execute("foreground-relative-output", {
+			agent: "worker", task: "Initial work", async: false, acceptance: false, output: "report.md",
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(first.isError, undefined, first.content[0]?.type === "text" ? first.content[0].text : undefined);
+		const report = first.details.results[0]?.savedOutputPath ?? "";
+		assert.match(fs.readFileSync(report, "utf-8"), /Stage 1 report/);
+
+		mockPi.onCall({ output: "Stage 2 report" });
+		const result = await executor.execute("revive-relative-output", {
+			action: "resume", id: first.details.runId, message: "Continue", acceptance: false,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir)) as AsyncExecutionResult;
+		assert.ok(!result.isError, result.content[0]?.text);
+		await readAsyncPayload(result.details.asyncId!);
+		assert.match(fs.readFileSync(report, "utf-8"), /Stage 1 report/);
+		const revivedReport = path.join(path.dirname(report), `report.${result.details.asyncId!.slice(0, 8)}.md`);
+		assert.match(fs.readFileSync(revivedReport, "utf-8"), /Stage 2 report/);
+	});
+
 	it("revives an inherited parent model outside the current registry", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		mockPi.onCall({ output: "Initial async work" });
 		const sourceId = `async-revive-parent-model-${Date.now().toString(36)}`;
@@ -1976,6 +2035,48 @@ syncBuiltinESMExports();
 		} finally {
 			fs.rmSync(asyncDir, { recursive: true, force: true });
 			fs.rmSync(budget.directory, { recursive: true, force: true });
+		}
+	});
+
+	it("append-step queues only agents whose launcher matches the running runner's, refusing before progress files are written", { skip: !createSubagentExecutor ? "executor not available" : undefined }, async () => {
+		const budget = (runId: string) => createRunFanoutBudget(runId, 8);
+		const progressPath = path.join(tempDir, "progress.md");
+		const agents = [makeAgent("worker"), makeAgent("netA", { launcher: "a" }), makeAgent("netA2", { launcher: "a" }), makeAgent("netB", { launcher: "b" })];
+		const executor = makeAsyncExecutor(agents, { runnerLaunchers: { a: ["true"], b: ["true"] } });
+		const cases: Array<[{ name: string; argv: string[] } | undefined, string, boolean]> = [
+			[{ name: "a", argv: ["true"] }, "netA2", true],
+			[{ name: "a", argv: ["true"] }, "netB", false],
+			[{ name: "a", argv: ["true"] }, "worker", false],
+			[undefined, "netA", false],
+		];
+		for (const [index, [launcher, agent, admitted]] of cases.entries()) {
+			const runId = `append-launcher-${index}-${Date.now().toString(36)}`;
+			const asyncDir = path.join(ASYNC_DIR, runId);
+			const runBudget = budget(runId);
+			try {
+				fs.mkdirSync(asyncDir, { recursive: true });
+				fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+					runId, sessionId: "session-123", mode: "chain", state: "running", startedAt: 100, lastUpdate: 200, cwd: tempDir, chainStepCount: 1,
+					...(launcher ? { launcher } : {}), steps: [{ agent: launcher ? "netA" : "worker", status: "running" }],
+				}));
+				writeRunFanoutBudgetDescriptor(asyncDir, runBudget);
+				fs.writeFileSync(progressPath, "existing progress\n");
+				const result = await executor.execute(`append-launcher-${index}`, { action: "append-step", id: runId, step: { parallel: [{ agent, task: "Work", progress: true }] } }, new AbortController().signal, undefined, makeMinimalCtx(tempDir)) as AsyncExecutionResult;
+				if (admitted) {
+					assert.equal(result.isError, undefined, result.content[0]?.text);
+					assert.equal(readPendingChainAppendRequests(asyncDir).length, 1);
+					assert.deepEqual(getRunFanoutBudgetSnapshot(runBudget), { used: 1, limit: 8, remaining: 7 });
+				} else {
+					assert.equal(result.isError, true, `case ${index}`);
+					assert.match(result.content[0]?.text ?? "", /its runner uses (?:launcher '\w+'|no launcher), but the appended agents use/);
+					assert.equal(readPendingChainAppendRequests(asyncDir).length, 0);
+					assert.deepEqual(getRunFanoutBudgetSnapshot(runBudget), { used: 0, limit: 8, remaining: 8 });
+					assert.equal(fs.readFileSync(progressPath, "utf-8"), "existing progress\n");
+				}
+			} finally {
+				fs.rmSync(asyncDir, { recursive: true, force: true });
+				fs.rmSync(runBudget.directory, { recursive: true, force: true });
+			}
 		}
 	});
 

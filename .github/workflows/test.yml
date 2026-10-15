@@ -168,7 +168,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pi-version: ["0.86.1", "1.0.0"]
+        pi-version: ["0.86.1", "1.0.0", "1.2.0"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -199,10 +199,9 @@ jobs:
         run: |
           node -e 'const a = require("node:assert/strict"); a.equal(process.platform, "linux"); a.equal(process.arch, "x64");'
           npm ci --ignore-scripts
-          # Bubblewrap needs only Ubuntu indexes, not the runner's third-party repositories.
-          printf '%s\n' 'deb http://archive.ubuntu.com/ubuntu jammy main universe' 'deb http://archive.ubuntu.com/ubuntu jammy-updates main universe' 'deb http://security.ubuntu.com/ubuntu jammy-security main universe' > "$RUNNER_TEMP/ubuntu.sources.list"
-          sudo apt-get -o Dir::Etc::sourcelist="$RUNNER_TEMP/ubuntu.sources.list" -o Dir::Etc::sourceparts=- update
-          sudo apt-get -o Dir::Etc::sourcelist="$RUNNER_TEMP/ubuntu.sources.list" -o Dir::Etc::sourceparts=- install -y bubblewrap
+          # Bubblewrap needs only the runner's Ubuntu mirror (sources.list), not its third-party repositories (sources.list.d).
+          sudo apt-get -o Dir::Etc::sourceparts=- update
+          sudo apt-get -o Dir::Etc::sourceparts=- install -y bubblewrap
       - name: Provision the checksum-pinned official binary
         shell: bash
         run: |

@@ -5,7 +5,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { awaitExistingAsyncRun } from "../../src/runs/background/await-async-run.ts";
+import { awaitExistingAsyncRun, claimWorkflowAwaitedResult } from "../../src/runs/background/await-async-run.ts";
+import { resultFilesForToolCall, resultPayloadPathForIndexedRun, resultPayloadPathForSessionRun, retireResultSnapshot, withResultRunLease, writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 
 let tempDir: string;
 
@@ -71,7 +72,7 @@ describe("awaitExistingAsyncRun", () => {
 		assert.equal(outcome.status === "settled" && outcome.result.output, "finished output");
 		assert.equal(outcome.status === "settled" && outcome.result.success, true);
 		assert.equal(outcome.status === "settled" && outcome.result.exitCode, 0);
-		assert.deepEqual(outcome.status === "settled" && outcome.result.importedPublication, { sessionId: "session-a", toolCallId: "tool-call-a" });
+		assert.deepEqual(outcome.status === "settled" && outcome.result.importedPublication, { sessionId: "session-a", toolCallId: "tool-call-a", snapshot: before[1]!.toString("utf-8") });
 		files.forEach((file, index) => assert.deepEqual(fs.readFileSync(file), before[index], file));
 	});
 
@@ -198,5 +199,64 @@ describe("awaitExistingAsyncRun", () => {
 		controller.abort(new Error("already stopped"));
 
 		await assert.rejects(awaitExistingAsyncRun(childDir(), "child-run", controller.signal), /already stopped/);
+	});
+});
+
+describe("claimWorkflowAwaitedResult", () => {
+	beforeEach(() => {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-claim-awaited-result-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	// The runner's paused result has no tool-call id and its final result adds one; state and timestamp can match.
+	const paused = { id: "child-run", runId: "child-run", sessionId: "session-a", state: "paused", timestamp: 1_000, results: [{ agent: "worker", output: "", success: false }] };
+	const final = { id: "child-run", toolCallId: "tool-call-a", sessionId: "session-a", state: "paused", timestamp: 1_000, results: [{ agent: "worker", output: "paused after interrupt", success: false }] };
+
+	async function importPaused(asyncDir: string) {
+		writeStatus(asyncDir, { state: "paused", steps: [{ agent: "worker", status: "paused" }] });
+		writePendingAsyncResultFile(path.join(asyncDir, "workflow-result.json"), paused);
+		const outcome = await awaitExistingAsyncRun(asyncDir, "child-run", new AbortController().signal);
+		assert.equal(outcome.status, "settled");
+		return { runId: "child-run", ...(outcome.status === "settled" ? outcome.result.importedPublication : {}) };
+	}
+
+	function assertFinalPublished(asyncDir: string): void {
+		const resultPath = path.join(asyncDir, "workflow-result.json");
+		assert.equal(JSON.parse(fs.readFileSync(resultPath, "utf-8")).toolCallId, "tool-call-a");
+		assert.equal(resultPayloadPathForSessionRun(asyncDir, "session-a", "child-run"), resultPath);
+		assert.equal(resultPayloadPathForIndexedRun(asyncDir, "child-run"), resultPath);
+		assert.deepEqual(resultFilesForToolCall(asyncDir, "tool-call-a"), ["workflow-result.json"]);
+	}
+
+	it("does not claim a final result that replaced the paused result the claimant imported", async () => {
+		const asyncDir = childDir();
+		const read = await importPaused(asyncDir);
+		writeAsyncResultFile(path.join(asyncDir, "workflow-result.json"), final);
+
+		assert.equal(claimWorkflowAwaitedResult(asyncDir, "workflow-b", read), undefined);
+		assertFinalPublished(asyncDir);
+	});
+
+	it("keeps a final result published after the claim when the claimed paused result is removed", async () => {
+		const asyncDir = childDir();
+		const resultPath = path.join(asyncDir, "workflow-result.json");
+		const read = await importPaused(asyncDir);
+		const claimedPath = claimWorkflowAwaitedResult(asyncDir, "workflow-b", read);
+		assert.equal(claimedPath, `${resultPath}.workflow-b.claimed`);
+		writeAsyncResultFile(resultPath, final);
+
+		assert.equal(retireResultSnapshot(resultPath, read, claimedPath), "replaced");
+		assert.equal(fs.existsSync(claimedPath!), false);
+		assertFinalPublished(asyncDir);
+	});
+
+	it("does not claim while another process holds the run's lease", async () => {
+		const asyncDir = childDir();
+		const read = await importPaused(asyncDir);
+		withResultRunLease(asyncDir, "child-run", () => assert.equal(claimWorkflowAwaitedResult(asyncDir, "workflow-b", read), undefined));
+		assert.equal(fs.readFileSync(path.join(asyncDir, "workflow-result.json"), "utf-8"), read.snapshot);
 	});
 });

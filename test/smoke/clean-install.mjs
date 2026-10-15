@@ -1,4 +1,4 @@
-// Run with Node >=22.19.0: node --experimental-strip-types test/smoke/clean-install.mjs [artifact-dir] [0.86.1|1.0.0]
+// Run with Node >=22.19.0: node --experimental-strip-types test/smoke/clean-install.mjs [artifact-dir] [0.86.1|1.0.0|1.2.0]
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 const version = process.argv[3] ?? "0.86.1";
-const supportedVersions = ["0.86.1", "1.0.0"];
+const supportedVersions = ["0.86.1", "1.0.0", "1.2.0"];
 assert.ok(supportedVersions.includes(version), `requires a supported smoke version: ${supportedVersions.join(", ")}`);
 const root = process.argv[2] ? path.resolve(process.argv[2]) : fs.mkdtempSync(path.join(os.tmpdir(), "clean-install-smoke-"));
 fs.mkdirSync(root, { recursive: true });
@@ -27,8 +27,8 @@ const env = {
 for (const key of Object.keys(env)) {
 	if (/API_KEY|TOKEN|SECRET|PASSWORD/.test(key) || ["NODE_OPTIONS", "NODE_PATH", "JITI_ALIAS"].includes(key)) delete env[key];
 }
-function run(name, command, args, workdir, extra = {}, success = true) {
-	const result = spawnSync(command, args, { cwd: workdir, env: { ...env, ...extra }, encoding: "utf8", timeout: 180000, maxBuffer: 10 * 1024 * 1024 });
+function run(name, command, args, workdir, extra = {}, success = true, timeout = 180000) {
+	const result = spawnSync(command, args, { cwd: workdir, env: { ...env, ...extra }, encoding: "utf8", timeout, maxBuffer: 10 * 1024 * 1024 });
 	fs.writeFileSync(path.join(root, `${name}.log`), `${result.stdout ?? ""}${result.stderr ?? ""}`);
 	assert.ifError(result.error);
 	if (success) assert.equal(result.status, 0, `${name}: ${result.stdout}\n${result.stderr}`);
@@ -36,7 +36,8 @@ function run(name, command, args, workdir, extra = {}, success = true) {
 	return result;
 }
 fs.writeFileSync(path.join(host, "package.json"), JSON.stringify({ private: true, dependencies: { "@earendil-works/pi-coding-agent": version } }));
-run("host-install", "npm", ["install", "--no-audit", "--no-fund"], host);
+// Installing the Pi host from the registry has taken over four minutes on slow days; the job timeout still bounds it.
+run("host-install", "npm", ["install", "--no-audit", "--no-fund"], host, {}, true, 420000);
 run("build-package", process.execPath, ["scripts/build-package.mjs"], source);
 const packed = JSON.parse(run("pack", "npm", ["pack", "--json", "--pack-destination", root, path.join(source, "dist-pkg")], source).stdout)[0];
 assert.ok(packed.files.some(file => file.path === "runner-peer-preload.mjs"), "peer preload must ship");
@@ -69,8 +70,10 @@ assert.deepEqual(resolved.missing, []);
 const tui = findHostPeerPackageDir(pi, "@earendil-works/pi-tui");
 assert.ok(tui.startsWith(host + path.sep), "TUI must come from the host install");
 assert.equal(resolved.aliases["@earendil-works/pi-tui"], resolvePackageSubpath(tui, "."));
+// Pi 1.2.0 dropped chord: alias it exactly when the real host install declares it.
+const hostDeclaresChord = Boolean(JSON.parse(fs.readFileSync(path.join(pi, "package.json"), "utf8")).dependencies?.["@earendil-works/chord"]);
 for (const specifier of ["@earendil-works/chord", "@earendil-works/chord/context"]) {
-	assert.ok(resolved.aliases[specifier]);
+	assert.equal(Boolean(resolved.aliases[specifier]), hostDeclaresChord, specifier);
 }
 assert.equal(resolved.aliases["@earendil-works/pi-client/unix"], undefined);
 fs.writeFileSync(path.join(root, "aliases.json"), JSON.stringify(resolved, null, 2));

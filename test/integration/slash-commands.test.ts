@@ -152,6 +152,7 @@ async function withIsolatedHome<T>(fn: () => Promise<T>): Promise<T> {
 function createCommandContext(
 	overrides: Partial<{
 		cwd: string;
+		mode: "tui" | "rpc" | "print";
 		hasUI: boolean;
 		custom: (...args: unknown[]) => Promise<unknown>;
 		notify: (message: string, type?: string) => void;
@@ -173,6 +174,7 @@ function createCommandContext(
 ) {
 	return {
 		cwd: overrides.cwd ?? process.cwd(),
+		mode: overrides.mode ?? (overrides.hasUI ? "tui" : "print"),
 		hasUI: overrides.hasUI ?? false,
 		ui: {
 			notify: overrides.notify ?? ((_message: string) => {}),
@@ -211,7 +213,6 @@ function writeProjectChain(root: string, fileName: string, content: string): voi
 
 function createWatchdogHarness(review?: WatchdogReviewFunction) {
 	const commands = new Map<string, RegisteredSlashCommand>();
-	const renderers = new Map<string, (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined>();
 	const sent: unknown[] = [];
 	const entries: Array<{ customType: string; data: unknown }> = [];
 	const pi = {
@@ -219,16 +220,14 @@ function createWatchdogHarness(review?: WatchdogReviewFunction) {
 		on() {},
 		registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
 		registerShortcut() {},
-		registerMessageRenderer(type: string, renderer: (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined) {
-			renderers.set(type, renderer);
-		},
+		registerMessageRenderer() {},
 		registerEntryRenderer() {},
 		appendEntry(customType: string, data: unknown) { entries.push({ customType, data }); },
 		getThinkingLevel() { return "medium" as const; },
 		sendMessage(message: unknown) { sent.push(message); },
 	};
 	const runtime = registerMainWatchdog!(pi as never, review ? { review } : undefined);
-	return { commands, renderers, runtime, sent, entries };
+	return { commands, runtime, sent, entries };
 }
 
 async function captureSlashCommandParams(
@@ -236,6 +235,7 @@ async function captureSlashCommandParams(
 	args: string,
 	cwd: string,
 	setup?: (pi: RuntimeSlashPi) => void,
+	ctxOverrides: Parameters<typeof createCommandContext>[0] = {},
 ): Promise<{ params: unknown; notifications: string[] }> {
 	return withIsolatedHome(async () => {
 		const commands = new Map<string, RegisteredSlashCommand>();
@@ -275,6 +275,7 @@ async function captureSlashCommandParams(
 				notify: (message) => {
 					notifications.push(message);
 				},
+				...ctxOverrides,
 			}));
 			return { params: requestedParams, notifications };
 		} finally {
@@ -469,7 +470,7 @@ describe("subagents watchdog slash command", { skip: !available ? "watchdog comm
 
 	it("routes explicit low and medium test findings to entries and high findings to messages", async () => {
 		await withIsolatedHome(async () => {
-			const { commands, renderers, sent, entries } = createWatchdogHarness();
+			const { commands, sent, entries } = createWatchdogHarness();
 			await commands.get("subagents-watchdog")!.handler("test concern low check the concern", createCommandContext());
 			await commands.get("subagents-watchdog")!.handler("test concern medium check the medium concern", createCommandContext());
 			await commands.get("subagents-watchdog")!.handler("test blocker high check the blocker", createCommandContext());
@@ -481,11 +482,8 @@ describe("subagents watchdog slash command", { skip: !available ? "watchdog comm
 			assert.equal(blocker.details?.severity, "blocker");
 			assert.equal(blocker.details?.importance, "high");
 			assert.match(blocker.content ?? "", /<blocker_guidance>/);
-
-			const renderer = renderers.get("subagent_watchdog_warning")!;
-			const rendered = renderer(blocker as never, { expanded: true }, { fg: (_name, value) => value, bold: (value) => value })!.render(100).join("\n");
-			assert.match(rendered, /Subagent watchdog Blocker \(displayed\): check the blocker/);
-			assert.match(rendered, /Manual \/subagents-watchdog test blocker message/);
+			assert.match(blocker.content ?? "", /<summary>check the blocker<\/summary>/);
+			assert.match(blocker.content ?? "", /Manual \/subagents-watchdog test blocker message/);
 		});
 	});
 
@@ -745,6 +743,13 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		assert.equal(opened, 1);
 	});
 
+	it("/subagents-fleet answers with the fleet status over RPC, where ui.custom is a no-op", async () => {
+		let opened = 0;
+		const { params } = await captureSlashCommandParams("subagents-fleet", "", process.cwd(), undefined, { mode: "rpc", hasUI: true, custom: async () => { opened += 1; return undefined; } });
+		assert.equal(opened, 0);
+		assert.deepEqual(params, { action: "status", view: "fleet" });
+	});
+
 	it("/subagents-stop keeps the selector within its allocated width", async () => {
 		await withTempProject("pi-stop-selector-width-", async (root) => {
 			const id = "scheduled-width-check";
@@ -834,6 +839,57 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		await new Promise<void>((resolve) => setImmediate(resolve));
 
 		assert.deepEqual(requestedParams, { action: "stop", id: "run-123", childId: "step-0-agent-0" });
+	});
+
+	const stopFromPicker = async (runIds: string[]) => {
+		const requested: Array<{ action: string; id: string }> = [];
+		const events = createEventBus();
+		events.on(SLASH_SUBAGENT_REQUEST_EVENT, (data) => {
+			const { requestId, params } = data as { requestId: string; params: { action: string; id: string } };
+			requested.push(params);
+			events.emit(SLASH_SUBAGENT_STARTED_EVENT, { requestId });
+			events.emit(SLASH_SUBAGENT_RESPONSE_EVENT, { requestId, result: { content: [{ type: "text", text: "stopped" }], details: { mode: "management", results: [] } }, isError: false });
+		});
+		const commands = new Map<string, RegisteredSlashCommand>();
+		registerSlashCommands!({ events, registerCommand(name, spec) { commands.set(name, spec); }, registerShortcut() {}, sendMessage() {} }, createState(process.cwd()));
+		for (const runId of runIds) {
+			const asyncDir = path.join(ASYNC_DIR, runId);
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId, mode: "single", state: "running", sessionId: "session-test", pid: process.pid, cwd: os.tmpdir(), startedAt: 100, lastUpdate: Date.now(), steps: [{ agent: "worker", status: "running", startedAt: 100 }] }));
+			updateActiveRunIndex(asyncDir, "running");
+		}
+		let rows: string[] = [];
+		let confirm: string[] = [];
+		try {
+			await commands.get("subagents-stop")!.handler("", createCommandContext({ hasUI: true, custom: (factory) => new Promise((resolve) => {
+				const selector = (factory as (tui: unknown, theme: unknown, keybindings: unknown, done: (result: unknown) => void) => { handleInput(data: string): void; render(width: number): string[] })(
+					{ requestRender() {} }, { fg: (_name: string, text: string) => text, bold: (text: string) => text }, {}, resolve);
+				rows = selector.render(120);
+				// Enter twice: select the first row, then confirm.
+				selector.handleInput("\r");
+				confirm = selector.render(120);
+				selector.handleInput("\r");
+			}) }));
+		} finally {
+			for (const runId of runIds) {
+				updateActiveRunIndex(path.join(ASYNC_DIR, runId), "complete");
+				fs.rmSync(path.join(ASYNC_DIR, runId), { recursive: true, force: true });
+			}
+		}
+		return { rows, confirm, requested };
+	};
+
+	it("/subagents-stop offers a first stop all row for two or more async runs and stops each of them", async () => {
+		const { rows, confirm, requested } = await stopFromPicker(["stop-all-a", "stop-all-b"]);
+		assert.ok(rows.some((row) => row.startsWith("› stop all 2 async runs")), rows.join("\n"));
+		assert.ok(confirm.includes("Confirm: stop all 2 async runs?"), confirm.join("\n"));
+		assert.deepEqual(requested.sort((left, right) => left.id.localeCompare(right.id)), [{ action: "stop", id: "stop-all-a" }, { action: "stop", id: "stop-all-b" }]);
+	});
+
+	it("/subagents-stop shows no stop all row for a single async run", async () => {
+		const { rows, requested } = await stopFromPicker(["stop-one"]);
+		assert.ok(!rows.some((row) => row.includes("stop all")), rows.join("\n"));
+		assert.deepEqual(requested, [{ action: "stop", id: "stop-one" }]);
 	});
 
 	it("/subagents-stop rejects extra arguments with usage text", async () => {

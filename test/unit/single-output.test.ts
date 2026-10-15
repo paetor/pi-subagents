@@ -9,8 +9,8 @@ import {
 	extractChildWrittenOutput,
 	finalizeSingleOutput,
 	formatSavedOutputReference,
-	injectOutputPathSystemPrompt,
 	injectSingleOutputInstruction,
+	isSettlementFatalOutputError,
 	normalizeSingleOutputOverride,
 	requestedOutputPathFromTask,
 	resolveSingleOutput,
@@ -90,22 +90,12 @@ describe("injectSingleOutputInstruction", () => {
 		assert.match(output, /Ignore any other output filename or output path mentioned elsewhere/);
 	});
 
-	it("tells read-only agents to return the artifact for runtime persistence", () => {
-		const output = injectSingleOutputInstruction("Analyze this", "/tmp/report.md", { tools: ["read", "grep", "find", "ls"] });
-		assert.match(output, /Return the complete artifact in your final response\./);
-		assert.match(output, /runtime will persist it to exactly this path: \/tmp\/report\.md/);
-		assert.match(output, /Do not call contact_supervisor merely because no write-capable tool is available\./);
-		assert.doesNotMatch(output, /Write your findings to exactly this path/);
-	});
-
-	it("treats the bundled reviewer profile as read-only in task and system-prompt instructions", () => {
-		const capabilities = { tools: ["read", "grep", "find", "ls", "watchdog_diff", "contact_supervisor"] };
-		const task = injectSingleOutputInstruction("Review this", "/tmp/review.md", capabilities);
-		const systemPrompt = injectOutputPathSystemPrompt("Review only", "/tmp/review.md", capabilities);
-
-		for (const output of [task, systemPrompt]) {
+	it("tells read-only agents, including the bundled reviewer profile, to return the artifact for runtime persistence", () => {
+		for (const tools of [["read", "grep", "find", "ls"], ["read", "grep", "find", "ls", "watchdog_diff", "contact_supervisor"]]) {
+			const output = injectSingleOutputInstruction("Analyze this", "/tmp/report.md", { tools });
 			assert.match(output, /Return the complete artifact in your final response\./);
-			assert.match(output, /runtime will persist it to exactly this path: \/tmp\/review\.md/);
+			assert.match(output, /runtime will persist it to exactly this path: \/tmp\/report\.md/);
+			assert.match(output, /Do not call contact_supervisor merely because no write-capable tool is available\./);
 			assert.doesNotMatch(output, /Write your findings to exactly this path/);
 		}
 	});
@@ -115,27 +105,6 @@ describe("requestedOutputPathFromTask", () => {
 	it("extracts direct-write and runtime-persisted report paths", () => {
 		assert.equal(requestedOutputPathFromTask("Write your findings to exactly this path: /tmp/direct.md"), "/tmp/direct.md");
 		assert.equal(requestedOutputPathFromTask("The runtime will persist it to exactly this path: `/tmp/persisted.md`"), "/tmp/persisted.md");
-	});
-});
-
-describe("injectOutputPathSystemPrompt", () => {
-	it("adds the authoritative runtime output path to the system prompt", () => {
-		const output = injectOutputPathSystemPrompt("Output format (`old.md`):", "/tmp/new.md");
-		assert.match(output, /^Output format \(`old\.md`\):/);
-		assert.match(output, /Runtime output path override:/);
-		assert.match(output, /Write your findings to exactly this path: \/tmp\/new\.md/);
-		assert.match(output, /Ignore any other output filename or output path mentioned elsewhere/);
-	});
-
-	it("uses runtime-persistence instructions in read-only system prompts", () => {
-		const output = injectOutputPathSystemPrompt("Analyze only", "/tmp/new.md", { tools: ["read"] });
-		assert.match(output, /Return the complete artifact in your final response\./);
-		assert.match(output, /runtime will persist it to exactly this path: \/tmp\/new\.md/);
-		assert.doesNotMatch(output, /Write your findings to exactly this path/);
-	});
-
-	it("leaves prompts unchanged when no output path is active", () => {
-		assert.equal(injectOutputPathSystemPrompt("Base prompt", undefined), "Base prompt");
 	});
 });
 
@@ -369,5 +338,27 @@ describe("finalizeSingleOutput", () => {
 		});
 
 		assert.equal(result.displayOutput.match(/Output saved to:/g)?.length, 1);
+	});
+});
+
+describe("isSettlementFatalOutputError", () => {
+	it("treats fatal errors as settlement failures regardless of output mode", () => {
+		assert.equal(isSettlementFatalOutputError({ fatalError: true, saveError: "fatal" }, "file-only"), true);
+		assert.equal(isSettlementFatalOutputError({ fatalError: true, saveError: "fatal" }, "inline"), true);
+		assert.equal(isSettlementFatalOutputError({ fatalError: true, saveError: "fatal" }, undefined), true);
+	});
+
+	it("fails settlement when required file-only output fails to save", () => {
+		assert.equal(isSettlementFatalOutputError({ saveError: "EACCES", savedPath: undefined }, "file-only"), true);
+	});
+
+	it("keeps save errors nonfatal in inline mode or when outputMode is omitted", () => {
+		assert.equal(isSettlementFatalOutputError({ saveError: "EACCES", savedPath: undefined }, "inline"), false);
+		assert.equal(isSettlementFatalOutputError({ saveError: "EACCES", savedPath: undefined }, undefined), false);
+	});
+
+	it("does not report error when output was successfully saved", () => {
+		assert.equal(isSettlementFatalOutputError({ savedPath: "/tmp/out.md" }, "file-only"), false);
+		assert.equal(isSettlementFatalOutputError({ savedPath: "/tmp/out.md" }, "inline"), false);
 	});
 });

@@ -25,6 +25,8 @@ export interface FakeChildResponse {
 	jsonl?: unknown[];
 	/** Leaves terminal lifecycle events to the scripted JSONL, for ordering-sensitive tests. */
 	omitImplicitFinalEvents?: boolean;
+	/** Simulates a host extension (e.g. a model router) switching the child off its launch model: every assistant message reports this model instead. */
+	reportedModel?: string;
 	/** Raw JSON lines; parsed into events for the in-process child without acceptance-report injection. */
 	stdoutRaw?: string;
 	steps?: Array<{ delay?: number; waitForPath?: string; jsonl?: unknown[]; stdoutRaw?: string }>;
@@ -122,7 +124,7 @@ function claimNextResponse(dir: string, haystack: string): FakeChildResponse {
 }
 
 /** Synthetic argv in the shape existing call assertions read; a child session receives no argv. */
-export function fakeChildArgs(launch: ChildSessionLaunch, task: string): string[] {
+function fakeChildArgs(launch: ChildSessionLaunch, task: string): string[] {
 	const args: string[] = ["--mode", "json", "-p"];
 	if (launch.storage.kind === "file") args.push("--session", launch.storage.sessionFile);
 	else if (launch.storage.kind === "dir") args.push("--session-dir", launch.storage.sessionDir);
@@ -300,15 +302,16 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 			};
 			const emit = (event: unknown): void => {
 				const typed = event as ChildSessionEvent & { message?: AgentMessage };
-				if ((typed.type === "message_end" || typed.type === "tool_result_end") && typed.message) messages.push(typed.message);
+				if (typed.type === "message_end" && typed.message) messages.push(typed.message);
 				for (const listener of [...listeners]) listener(typed);
 			};
 			let sawProviderError = false;
 			const emitEntries = async (entries: unknown[], task: string, injectAcceptance = true): Promise<void> => {
 				for (const entry of entries) {
 					if (record.aborted) return;
-					const typed = entry as { type?: string; message?: { content?: Array<{ type?: string; text?: string }>; errorMessage?: string; stopReason?: string } };
-					if (typed?.type === "message_end" && injectAcceptance) {
+					const typed = entry as { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }>; errorMessage?: string; stopReason?: string } };
+					// Only the child's own replies carry its acceptance report; tool results are returned verbatim.
+					if (typed?.type === "message_end" && typed.message?.role !== "toolResult" && injectAcceptance) {
 						const textPart = typed.message?.content?.find?.((part) => part?.type === "text");
 						const providerError = Boolean(typed.message?.errorMessage || typed.message?.stopReason === "error");
 						if (providerError) sawProviderError = true;
@@ -389,15 +392,15 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 				} else if (response.stdoutRaw !== undefined) {
 					await emitEntries(parseRawStdout(response), task, false);
 				} else if (Array.isArray(response.echoEnv) && response.echoEnv.length > 0) {
-					await emitEntries([defaultAssistantMessage(JSON.stringify(Object.fromEntries(response.echoEnv.map((key) => [key, null]))), model)], task);
+					await emitEntries([defaultAssistantMessage(JSON.stringify(Object.fromEntries(response.echoEnv.map((key) => [key, null]))), reportedModel(response.reportedModel) ?? model)], task);
 				} else if (typeof response.output === "string") {
-					await emitEntries([defaultAssistantMessage(response.output, model)], task);
+					await emitEntries([defaultAssistantMessage(response.output, reportedModel(response.reportedModel) ?? model)], task);
 				}
 				if (Object.prototype.hasOwnProperty.call(response, "structuredOutput")) {
 					launch.runtime.structuredOutput?.capture(response.structuredOutput, undefined);
 					emit({ type: "tool_execution_start", toolName: "structured_output", args: { value: response.structuredOutput } });
-					emit({ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } });
 					emit({ type: "tool_execution_end", toolName: "structured_output" });
+					emit({ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } });
 				}
 				if (record.aborted) return;
 				if (!response.omitImplicitFinalEvents) {

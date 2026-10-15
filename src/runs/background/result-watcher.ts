@@ -23,7 +23,7 @@ import { projectNestedRegistryForRoot, sanitizeSummary } from "../shared/nested-
 import { resolveWatchPath } from "../../shared/utils.ts";
 import { recordWaitCompletion } from "./wait-completions.ts";
 import { MISSION_BINDING_FILE, syncMissionFromAsyncCompletion } from "../../missions/lifecycle.ts";
-import { missionObserverResultCandidateFiles, promotePendingResultFile, removeMissionObserverIndex, removeResultIndex, resultCandidateFilesForSession, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, writeAsyncResultFile, writeResultIndexForData } from "./result-files.ts";
+import { acknowledgeMissionObserverSnapshot, missionObserverResultCandidateFiles, promotePendingResultFile, readResultPayload, resultCandidateFilesForSession, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, resultSnapshotReplaced, retireResultSnapshot, withResultRunLease, writeAsyncResultFile, writeResultIndexForData, type ResultSnapshot } from "./result-files.ts";
 import type { CompletionNotifier, CompletionNotification } from "./notify.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
 
@@ -176,25 +176,18 @@ function hasDeliveredNotification(data: ResultFileData): boolean {
 	return typeof data.notificationDeliveredAt === "number" && Number.isFinite(data.notificationDeliveredAt);
 }
 
-type PublicResultIdentity = {
-	state?: string;
-	timestamp?: number;
-};
-
-function resultPayloadWasReplaced(delivered: ResultFileData, disk: PublicResultIdentity | undefined): boolean {
-	if (!disk) return false;
-	const deliveredState = typeof delivered.state === "string" ? delivered.state : undefined;
-	if (disk.state && deliveredState && disk.state !== deliveredState) return true;
-	const deliveredTimestamp = typeof delivered.timestamp === "number" && Number.isFinite(delivered.timestamp)
-		? delivered.timestamp
-		: undefined;
-	return disk.timestamp !== undefined && deliveredTimestamp !== undefined && disk.timestamp !== deliveredTimestamp;
-}
-
-function markDeliveredNotification(resultPath: string, data: ResultFileData, runId: string, now: number): ResultFileData {
-	const marked = { ...data, runId, notificationDeliveredAt: now };
-	writeAsyncResultFile(resultPath, marked);
-	return marked;
+/** Marks the payload that was delivered, unless a newer payload replaced it (then returns undefined). */
+function markDeliveredNotification(resultPath: string, data: ResultFileData, read: ResultSnapshot, now: number): { data: ResultFileData; read: ResultSnapshot } | undefined {
+	const marked = { ...data, runId: read.runId, notificationDeliveredAt: now };
+	return withResultRunLease(path.dirname(resultPath), read.runId, () => {
+		if (resultSnapshotReplaced(resultPath, read)) return undefined;
+		const { state } = writeAsyncResultFile(resultPath, marked);
+		// writeAsyncResultFile writes JSON.stringify(payload, null, 2). A denied promotion leaves the
+		// older public payload in place.
+		const snapshot = JSON.stringify(marked, null, 2);
+		const stalePublic = state === "pending" ? readResultPayload(resultPath) : undefined;
+		return { data: marked, read: { ...read, snapshot, stalePublic } };
+	});
 }
 
 /**
@@ -334,18 +327,14 @@ export function createResultWatcher(
 		return Boolean(deps.observeCompletion && !deps.observedCompletionRunIds);
 	};
 
-	const removeDeliveredResult = (file: string, sessionId: string, runId: string, toolCallId: string | undefined): boolean => {
+	const removeDeliveredResult = (file: string, triggerTurn: boolean, read: ResultSnapshot): void => {
+		identityCache.delete(file);
 		try {
-			if (publicResultFileExists(file)) fsApi.unlinkSync(publicResultPath(file));
-			identityCache.delete(file);
-			removeResultIndex(resultsDir, sessionId, runId, toolCallId);
-			return true;
+			if (retireResultSnapshot(publicResultPath(file), read) === "replaced") scheduleResult(file, triggerTurn);
 		} catch (error) {
-			if (!isAbsentResultCandidate(error)) {
-				console.error(`Failed to remove delivered subagent result '${publicResultPath(file)}'; will retry:`, error);
-				return false;
-			}
-			return true;
+			if (isAbsentResultCandidate(error)) return;
+			console.error(`Failed to remove delivered subagent result '${publicResultPath(file)}'; will retry:`, error);
+			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 		}
 	};
 	const handleResult = async (file: string, triggerTurn: boolean) => {
@@ -366,30 +355,25 @@ export function createResultWatcher(
 		processing.add(file);
 		let rereadReplacedPayload = false;
 		let resultPath = publicResultPath(file);
-		const readPublicResultIdentity = (): PublicResultIdentity | undefined => {
-			if (!publicResultFileExists(file)) return undefined;
-			const parsed: unknown = JSON.parse(fsApi.readFileSync(publicResultPath(file), "utf-8"));
-			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-			const record = parsed as Record<string, unknown>;
-			const state = typeof record.state === "string" && record.state ? record.state : undefined;
-			const timestamp = typeof record.timestamp === "number" && Number.isFinite(record.timestamp)
-				? record.timestamp
-				: undefined;
-			if (!state && timestamp === undefined) return undefined;
-			return { state, timestamp };
+		// The public payload is read just before the payload itself, so anything published after the
+		// read differs from both.
+		let publicAtRead: string | undefined;
+		const readPayload = (payloadPath: string): string => {
+			publicAtRead = readResultPayload(publicResultPath(file));
+			return fsApi.readFileSync(payloadPath, "utf-8");
 		};
 		try {
 			const payloadPath = resultPayloadPath(file, observed);
 			if (!payloadPath) return;
 			resultPath = payloadPath;
-			let raw = fsApi.readFileSync(resultPath, "utf-8");
+			let raw = readPayload(resultPath);
 			let identity = resultFileIdentity(raw, file);
 			if (identity.sessionId && identity.runId) {
 				const pendingState = promotePendingResultFile(resultsDir, identity.sessionId, identity.runId, file);
 				if (pendingState === "promoted") {
 					identityCache.delete(file);
 					resultPath = publicResultPath(file);
-					raw = fsApi.readFileSync(resultPath, "utf-8");
+					raw = readPayload(resultPath);
 					identity = resultFileIdentity(raw, file);
 				} else if (pendingState === "pending") {
 					const pendingPath = resultPayloadPathForSessionRun(resultsDir, identity.sessionId, identity.runId);
@@ -398,23 +382,11 @@ export function createResultWatcher(
 						return;
 					}
 					resultPath = pendingPath;
-					raw = fsApi.readFileSync(resultPath, "utf-8");
+					raw = readPayload(resultPath);
 					identity = resultFileIdentity(raw, file);
 				}
 			}
 			let data = parseResult(raw);
-			const markReplacedPayload = (): boolean => {
-				try {
-					if (!resultPayloadWasReplaced(data, readPublicResultIdentity())) return false;
-				} catch (error) {
-					if (isAccessDenied(error)) throw error;
-					if (isAbsentResultCandidate(error)) return false;
-					console.error(`Failed to re-read subagent result file '${publicResultPath(file)}':`, error);
-				}
-				identityCache.delete(file);
-				rereadReplacedPayload = true;
-				return true;
-			};
 			if (typeof data.sessionId !== "string" || !data.sessionId) return;
 			const sessionId = data.sessionId;
 			const completionOwnerId = data.completionOwnerId;
@@ -422,6 +394,18 @@ export function createResultWatcher(
 				? data.runId
 				: typeof data.id === "string" && data.id ? data.id : file.replace(/\.json$/i, "");
 			const toolCallId = typeof data.toolCallId === "string" ? data.toolCallId : undefined;
+			let read: ResultSnapshot = { runId, sessionId, toolCallId, snapshot: raw, ...(publicAtRead !== undefined && publicAtRead !== raw ? { stalePublic: publicAtRead } : {}) };
+			const markReplacedPayload = (): boolean => {
+				try {
+					if (!resultSnapshotReplaced(publicResultPath(file), read)) return false;
+				} catch (error) {
+					if (isAccessDenied(error)) throw error;
+					console.error(`Failed to re-read subagent result file '${publicResultPath(file)}':`, error);
+				}
+				identityCache.delete(file);
+				rereadReplacedPayload = true;
+				return true;
+			};
 			let observerSucceeded = true;
 			try {
 				syncMissionFromAsyncCompletion({ ...data, runId });
@@ -435,7 +419,14 @@ export function createResultWatcher(
 				observerSucceeded = false;
 				console.error(`Completion observer failed for '${resultPath}':`, error);
 			}
-			if (observerSucceeded) removeMissionObserverIndex(resultsDir, runId);
+			if (observerSucceeded) {
+				try {
+					if (acknowledgeMissionObserverSnapshot(publicResultPath(file), read) === "replaced") rereadReplacedPayload = true;
+				} catch (error) {
+					observerSucceeded = false;
+					console.error(`Failed to acknowledge the mission observer for '${resultPath}'; will retry:`, error);
+				}
+			}
 			const epoch = deliveryEpoch;
 			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 			// Recorded before dedupe and before the unlink below so bg_wait can
@@ -473,7 +464,7 @@ export function createResultWatcher(
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
-				if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				removeDeliveredResult(file, triggerTurn, read);
 				return;
 			}
 
@@ -536,7 +527,7 @@ export function createResultWatcher(
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
-				if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				removeDeliveredResult(file, triggerTurn, read);
 				return;
 			}
 
@@ -591,8 +582,13 @@ export function createResultWatcher(
 			if (markReplacedPayload()) return;
 			deps.onResultDelivered?.(runId);
 			try {
-				data = markDeliveredNotification(publicResultPath(file), data, runId, Date.now());
+				const marked = markDeliveredNotification(publicResultPath(file), data, read, Date.now());
 				identityCache.delete(file);
+				if (!marked) {
+					rereadReplacedPayload = true;
+					return;
+				}
+				({ data, read } = marked);
 			} catch (error) {
 				console.error(`Failed to mark subagent result notification delivered for '${resultPath}'; will retry:`, error);
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
@@ -631,7 +627,7 @@ export function createResultWatcher(
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
-			if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+			removeDeliveredResult(file, triggerTurn, read);
 		} catch (error) {
 			if (isAccessDenied(error)) {
 				console.error(`Failed to process subagent result file '${resultPath}'; will retry:`, error);

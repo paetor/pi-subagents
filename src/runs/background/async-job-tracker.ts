@@ -6,6 +6,7 @@ import { formatControlNoticeMessage } from "../shared/subagent-control.ts";
 import {
 	type AsyncJobState,
 	type AsyncStartedEvent,
+	type AsyncWidgetLayout,
 	type ControlEvent,
 	type SteeringNotice,
 	type SubagentChildStatusEvent,
@@ -36,6 +37,7 @@ interface AsyncJobTrackerOptions {
 	resultsDir?: string;
 	widgetEnabled?: boolean;
 	widgetCollapsed?: boolean;
+	widgetLayout?: AsyncWidgetLayout;
 	platform?: NodeJS.Platform;
 	onJobTerminal?: (job: AsyncJobState) => void;
 	onJobCleanup?: (asyncId: string) => void;
@@ -44,6 +46,8 @@ interface AsyncJobTrackerOptions {
 	now?: () => number;
 	/** Resolve native supervisor requests without scanning supervisor mailboxes. */
 	supervisorRequestState?: (event: ControlEvent) => "pending" | "resolved" | "unknown";
+	/** Called whenever the tracked jobs changed enough to re-render the widget. */
+	onJobsChanged?: () => void;
 }
 
 const CONTROL_EVENT_READ_CHUNK_BYTES = 64 * 1024;
@@ -105,8 +109,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		}, run);
 	};
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
+		options.onJobsChanged?.();
 		if (state.widgetsSuspended) return;
-		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed);
+		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed, options.widgetLayout);
 		(ctx.ui as { requestRender?: () => void }).requestRender?.();
 	};
 	const rerenderLastWidget = (jobs = Array.from(state.asyncJobs.values())) => {
@@ -126,7 +131,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (state.widgetsSuspended) return;
 			const requestRender = (ctx.ui as { requestRender?: () => void }).requestRender;
 			if (requestRender) requestRender.call(ctx.ui);
-			else renderWidget(ctx, Array.from(state.asyncJobs.values()), options.widgetCollapsed);
+			else renderWidget(ctx, Array.from(state.asyncJobs.values()), options.widgetCollapsed, options.widgetLayout);
 		});
 	};
 	const refreshWidget = (ctx: ExtensionContext) => rerenderWidget(ctx);

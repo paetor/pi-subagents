@@ -12,10 +12,10 @@ import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
 import { createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, removeTempDir } from "../support/helpers.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
+import { buildRunnerChildLaunch } from "../../src/runs/background/runner-child-launch.ts";
 import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
 import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
-import { rewriteSubagentPrompt } from "../../src/runs/shared/subagent-prompt-runtime.ts";
 import type { ForegroundChildSessionControls, SingleResult } from "../../src/shared/types.ts";
 
 async function waitFor(read: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -70,6 +70,35 @@ describe("in-process foreground child", () => {
 		} finally {
 			delete process.env.PI_SUBAGENT_CHILD_AGENT;
 		}
+	});
+
+	it("records the parent session in the run metadata and passes its file to the child session", async () => {
+		mockPi.onCall({ output: "done" });
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "parent-link",
+			parentSessionId: "parent-session-id",
+			parentSessionFile,
+			artifactsDir: path.join(tempDir, "artifacts"),
+			artifactConfig: { enabled: true, includeInput: false, includeOutput: false, includeMetadata: true },
+		});
+		assert.equal(result.exitCode, 0);
+		assert.ok(result.artifactPaths?.metadataPath);
+		const metadata = JSON.parse(fs.readFileSync(result.artifactPaths.metadataPath, "utf-8")) as { parentSessionId?: string };
+		assert.equal(metadata.parentSessionId, "parent-session-id");
+		assert.equal(mockPi.sessions[0]?.launch.parentSessionFile, parentSessionFile);
+	});
+
+	it("passes a detached runner step's parent session file to the child session", () => {
+		const launch = buildRunnerChildLaunch({
+			agent: "worker",
+			task: "Work",
+			inheritProjectContext: false,
+			inheritGlobalContext: false,
+			inheritSkills: false,
+			parentSessionFile: "/sessions/parent.jsonl",
+		}, { cwd: tempDir, id: "parent-file-runner", flatIndex: 0 }, { sessionEnabled: true, sessionDir: path.join(tempDir, "run-0"), watchdogStatus() {} });
+		assert.equal(launch.session.parentSessionFile, "/sessions/parent.jsonl");
 	});
 
 	it("projects authoritative native-machine Git evidence into the public foreground result", async () => {
@@ -228,8 +257,8 @@ describe("in-process foreground child", () => {
 			structuredOutputAcceptanceReport: acceptanceReport,
 			jsonl: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true }, acceptanceReport } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "message_end", message: { role: "assistant", content: [], model: "mock/test-model", stopReason: "error", errorMessage: "later provider failure", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
 			],
 		});
@@ -251,8 +280,8 @@ describe("in-process foreground child", () => {
 			structuredOutputCapture: { ok: true },
 			jsonl: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			],
 			hangUntilAbort: true,
 		});
@@ -272,8 +301,8 @@ describe("in-process foreground child", () => {
 		const structured = createStructuredOutputRuntime({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, tempDir);
 		mockPi.onCall({ jsonl: [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: "invalid" } } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
 			{ type: "tool_execution_end", toolName: "structured_output", isError: true },
+			{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
 		] });
 
 		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "structured-invalid", acceptance: false, structuredOutput: structured });
@@ -406,25 +435,10 @@ describe("default child session factory", () => {
 		await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi() }).create({ ...stubLaunch, tools: ["read"] });
 	});
 
-	it("runs the child prompt rewrite before ambient prompt capture without reordering ambient extensions", async () => {
-		const agentPrompt = '<active_agent name="remotion-editor"/>\n\neditor instructions';
-		const globalPath = path.join(process.env.HOME ?? process.env.USERPROFILE ?? process.cwd(), ".pi", "agent", "AGENTS.md");
-		const projectPath = path.join(process.cwd(), "AGENTS.md");
-		const orchestrationSkill = '<skill><name>pi-subagents</name><location>/skills/pi-subagents/SKILL.md</location></skill>';
-		const assemble = (extra: string) => `${agentPrompt}${extra}`;
-		const destructivePrompt = assemble([
-			"", "<project_context>",
-			`<project_instructions path="${globalPath}">global parent-only instructions</project_instructions>`,
-			`<project_instructions path="${projectPath}">project instructions</project_instructions>`,
-			"</project_context>", orchestrationSkill,
-		].join("\n\n"));
-		const boundaryOnlyPrompt = assemble("");
+	it("runs the child prompt filter first and the child boundary last without reordering other extensions", async () => {
 		const orderedPaths: string[][] = [];
-		const captureResults: boolean[] = [];
-		const forwardedPrompts: string[] = [];
 		const pi = stubPi();
 		pi.DefaultResourceLoader = class {
-			loaded = false;
 			private readonly options: { extensionsOverride?: (base: { extensions: Array<{ path: string }>; errors: unknown[]; runtime: object }) => { extensions: Array<{ path: string }>; errors: unknown[]; runtime: object } };
 			private result = { extensions: [] as Array<{ path: string }>, errors: [] as unknown[], runtime: {} };
 			constructor(options: typeof this.options) { this.options = options; }
@@ -433,8 +447,9 @@ describe("default child session factory", () => {
 					extensions: [
 						{ path: "/ambient/first.ts" },
 						{ path: "/ambient/claude-bridge.ts" },
-						{ path: "/ambient/last.ts" },
 						{ path: "<inline:pi-subagents:prompt-runtime>" },
+						{ path: "<inline:pi-subagents:prompt-boundary>" },
+						{ path: "/ambient/last.ts" },
 						{ path: "<inline:pi-subagents:completion-intent>" },
 					],
 					errors: [] as unknown[],
@@ -442,31 +457,12 @@ describe("default child session factory", () => {
 				};
 				this.result = this.options.extensionsOverride?.(base) ?? base;
 				orderedPaths.push(this.result.extensions.map(({ path: extensionPath }) => extensionPath));
-				for (const original of [boundaryOnlyPrompt, destructivePrompt]) {
-					let prompt = original;
-					let captured: string | undefined;
-					for (const { path: extensionPath } of this.result.extensions) {
-						if (extensionPath === "<inline:pi-subagents:prompt-runtime>") {
-							prompt = rewriteSubagentPrompt(prompt, { inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: true });
-						}
-						if (extensionPath === "/ambient/claude-bridge.ts") captured = prompt;
-					}
-					captureResults.push(captured === prompt || (captured !== undefined && prompt.includes(captured)));
-					forwardedPrompts.push(prompt);
-				}
 			}
 			getExtensions() { return this.result; }
 		} as unknown as PiCodingAgentModule["DefaultResourceLoader"];
 
 		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
-		await factory.create({
-			...stubLaunch,
-			ambientExtensions: true,
-			hooks: [
-				{ name: "pi-subagents:prompt-runtime", factory() {} },
-				{ name: "pi-subagents:completion-intent", factory() {} },
-			],
-		});
+		await factory.create({ ...stubLaunch, ambientExtensions: true });
 
 		assert.deepEqual(orderedPaths[0], [
 			"<inline:pi-subagents:prompt-runtime>",
@@ -474,12 +470,8 @@ describe("default child session factory", () => {
 			"/ambient/claude-bridge.ts",
 			"/ambient/last.ts",
 			"<inline:pi-subagents:completion-intent>",
+			"<inline:pi-subagents:prompt-boundary>",
 		]);
-		assert.deepEqual(captureResults, [true, true], "bridge-style capture must resolve both wrapping and destructive filtering");
-		assert.match(forwardedPrompts[1]!, /editor instructions/);
-		assert.match(forwardedPrompts[1]!, /project instructions/);
-		assert.doesNotMatch(forwardedPrompts[1]!, /global parent-only instructions/);
-		assert.doesNotMatch(forwardedPrompts[1]!, /<name>pi-subagents<\/name>/);
 	});
 
 	it("resolves models from providers queued during child extension loading", async () => {
@@ -598,6 +590,42 @@ describe("default child session factory", () => {
 			}
 		} finally {
 			removeTempDir(projectDir);
+		}
+	});
+
+	it("records the launching session as the parent of a new child session", async () => {
+		const host = await import("@earendil-works/pi-coding-agent");
+		const dir = createTempDir("pi-subagents-parent-session-");
+		try {
+			const parentSessionFile = path.join(dir, "parent.jsonl");
+			const forkedFile = path.join(dir, "forks", "forked.jsonl");
+			fs.mkdirSync(path.join(dir, "run-0"));
+			fs.mkdirSync(path.dirname(forkedFile));
+			fs.writeFileSync(forkedFile, `${JSON.stringify({ type: "session", version: 3, id: "forked", timestamp: new Date().toISOString(), cwd: dir, parentSession: "/sessions/source.jsonl" })}\n`);
+			const managers: InstanceType<typeof host.SessionManager>[] = [];
+			const pi = stubPi();
+			pi.SessionManager = host.SessionManager;
+			const createAgentSession = pi.createAgentSession;
+			pi.createAgentSession = (async (options: { sessionManager: InstanceType<typeof host.SessionManager> }) => {
+				managers.push(options.sessionManager);
+				return createAgentSession(options as Parameters<typeof createAgentSession>[0]);
+			}) as typeof createAgentSession;
+			const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
+			const storages: ChildSessionLaunch["storage"][] = [
+				{ kind: "file", sessionFile: path.join(dir, "run-0", "session.jsonl") },
+				{ kind: "dir", sessionDir: path.join(dir, "run-1") },
+				{ kind: "file", sessionFile: forkedFile },
+			];
+			for (const storage of storages) await factory.create({ ...stubLaunch, cwd: dir, storage, parentSessionFile });
+			const headers = managers.map((manager) => {
+				manager.appendMessage({ role: "user", content: "Task", timestamp: Date.now() });
+				manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "Done" }], api: "test", provider: "test", model: "test", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() });
+				return JSON.parse(fs.readFileSync(manager.getSessionFile()!, "utf-8").split("\n")[0]!) as { parentSession?: string };
+			});
+			// Pi records a fork's parent as the parent's session file; a forked child keeps the parent its fork recorded.
+			assert.deepEqual(headers.map((header) => header.parentSession), [parentSessionFile, parentSessionFile, "/sessions/source.jsonl"]);
+		} finally {
+			removeTempDir(dir);
 		}
 	});
 

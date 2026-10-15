@@ -288,6 +288,34 @@ describe("below-editor subagent FleetView", () => {
 		}
 	});
 
+	it("shows external-job problems once as TUI warnings instead of printing them over an interactive session", () => {
+		clearExternalRuns();
+		const notices: Array<[string, string]> = [];
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (message?: unknown) => warnings.push(String(message));
+		const state = stateForTest();
+		state.lastUiContext = { hasUI: true, ui: { notify: (message: string, level: string) => notices.push([message, level]) } } as never;
+		try {
+			(globalThis as Record<PropertyKey, unknown>)[Symbol.for(EXTERNAL_RUN_REGISTRY_KEY)] = {
+				version: EXTERNAL_RUN_REGISTRY_VERSION,
+				runs: new Map<string, unknown>([["session-current\0bad", { id: "bad", sessionId: "session-current", source: "tool", label: "Bad", state: "running", startedAt: Number.NaN }]]),
+			};
+			collectFleetStatusEntries(state);
+			(globalThis as Record<PropertyKey, unknown>)[Symbol.for(EXTERNAL_RUN_REGISTRY_KEY)] = "not a registry";
+			collectFleetStatusEntries(state);
+			collectFleetStatusEntries(state);
+			assert.deepEqual(warnings, []);
+			assert.deepEqual(notices.map(([, level]) => level), ["warning", "warning"]);
+			assert.match(notices[0]![0], /^\[pi-subagents\] Removed Malformed cached external run 'bad': /);
+			assert.match(notices[1]![0], /^\[pi-subagents\] Failed to inspect external jobs: Malformed external-run registry/);
+			assert.ok(!notices.some(([message]) => message.includes("\0")));
+		} finally {
+			console.warn = originalWarn;
+			clearExternalRuns();
+		}
+	});
+
 	it("resolves configured FleetView placement with a below-editor fallback", () => {
 		assert.equal(resolveFleetViewPlacement(undefined), "belowEditor");
 		assert.equal(resolveFleetViewPlacement("belowEditor"), "belowEditor");
@@ -361,7 +389,7 @@ describe("below-editor subagent FleetView", () => {
 			assert.ok(expandedLines.some((line) => line.includes("> main")));
 			assert.ok(expandedLines.some((line) => line.includes("  worker-0")), "unselected agents use blank focus space");
 			assert.ok(expandedLines.every((line) => !/[⏺◯]/u.test(line)), "selection avoids terminal-ambiguous circle glyphs");
-			assert.ok(expandedLines.some((line) => line.includes("worker-0 (fable-5 · thinking low)")));
+			assert.ok(expandedLines.some((line) => line.includes("worker-0 (anthropic/fable-5 · thinking low)")));
 			assert.ok(expandedLines.some((line) => line.includes("11s · ↓ 13.1k tokens")));
 			assert.ok(expandedLines.some((line) => line.includes("↓ 1 more")));
 			for (const line of expandedLines) assert.ok(visibleWidth(line) <= 80, `line exceeded width: ${line}`);
@@ -1297,7 +1325,7 @@ describe("below-editor subagent FleetView", () => {
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(140).join("\n");
 			assert.match(lines, /workflow · running/);
-			assert.match(lines, /Plan: scan · Find seams \(scout\) \[fresh\] \(gpt-5\.6-luna · thinking max\) · complete/);
+			assert.match(lines, /Plan: scan · Find seams \(scout\) \[fresh\] \(openai-codex\/gpt-5\.6-luna · thinking max\) · complete/);
 			assert.match(lines, /Review: review \(reviewer\) \[fork\] · running · tool grep/);
 			assert.match(lines, /Verify: test \(tester\) · pending/);
 		} finally {
@@ -1509,7 +1537,7 @@ describe("below-editor subagent FleetView", () => {
 			const component = widgetFactory!(tui, theme);
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(180);
-			assert.ok(lines.some((line) => line.includes("reviewer (gpt-5 · thinking medium)")));
+			assert.ok(lines.some((line) => line.includes("reviewer (openai/gpt-5 · thinking medium)")));
 			assert.ok(lines.some((line) => line.includes("worker")));
 			assert.ok(lines.every((line) => !line.includes("Review only authentication") && !line.includes("Implement only billing") && !line.includes("Review the authentication changes")));
 			assert.ok(lines.some((line) => line.includes("↓ 4.2k tokens")));

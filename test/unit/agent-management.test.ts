@@ -203,7 +203,7 @@ describe("agent management config parsing", () => {
 		assert.ok(reviewer, "reviewer builtin should be present in capability output");
 		assert.deepEqual(reviewer.tools.names, ["read", "grep", "find", "ls", "watchdog_diff", "contact_supervisor"]);
 		assert.match(readText(listed), /Tools: read, grep, find, ls, watchdog_diff, contact_supervisor/);
-		assert.equal("acceptance" in reviewer, false);
+		assert.deepEqual(reviewer.acceptance, { role: "read-only" });
 	});
 
 	it("reports bare and disabled acceptance declarations in capabilities", () => {
@@ -1062,6 +1062,25 @@ Advise only.
 		assert.ok(!content.includes(tempDir));
 	});
 
+	it("keeps launcher file-only: management cannot set it, conflicting runners are refused, and unrelated updates keep it", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const created = handleCreate({ config: { name: "netty", description: "Net agent", scope: "project", launcher: "net" } }, ctx);
+		assert.equal(created.isError, true);
+		assert.match(readText(created), /config\.launcher is not supported/);
+		assert.equal(fs.existsSync(path.join(tempDir, ".pi", "agents", "netty.md")), false);
+
+		const agentPath = path.join(tempDir, ".pi", "agents", "sandboxed.md");
+		fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+		fs.writeFileSync(agentPath, "---\nname: sandboxed\ndescription: Sandboxed agent\nlauncher: net\n---\nOriginal prompt.\n");
+		const external = handleUpdate({ agent: "sandboxed", config: { runner: { type: "external-cli", command: "node" } } }, ctx);
+		assert.equal(external.isError, true);
+		assert.match(readText(external), /cannot be combined with this agent's 'launcher'/);
+
+		const updated = handleUpdate({ agent: "sandboxed", config: { description: "Updated agent" } }, ctx);
+		assert.equal(updated.isError, false);
+		assert.match(fs.readFileSync(agentPath, "utf-8"), /^launcher: net$/m);
+	});
+
 	it("fails when extension frontmatter cannot be reread", () => {
 		const filePath = path.join(tempDir, ".pi", "agents", "removed.md");
 		assert.throws(
@@ -1224,7 +1243,7 @@ Drive the failing test first.
 	});
 
 	for (const action of ["model", "thinking"]) {
-		it(`awaits an offline registry refresh before opening the ${action} picker`, async () => {
+		it(`awaits an offline registry refresh before opening the ${action} picker over RPC`, async () => {
 			const agentPath = path.join(tempDir, ".pi", "agents", "refresh-worker.md");
 			fs.mkdirSync(path.dirname(agentPath), { recursive: true });
 			fs.writeFileSync(agentPath, "---\nname: refresh-worker\ndescription: Refresh test\nmodel: custom/fresh\n---\nPrompt.\n");
@@ -1232,7 +1251,7 @@ Drive the failing test first.
 			let choices: string[] = [];
 			const warnings: string[] = [];
 			await openSubagentsAdmin({ sendMessage: () => assert.fail("cancel must not save") } as never, {
-				cwd: tempDir, hasUI: true,
+				cwd: tempDir, hasUI: true, mode: "rpc",
 				modelRegistry: {
 					refresh: async (options: { allowNetwork: boolean; signal: AbortSignal }) => {
 						assert.equal(options.allowNetwork, false);
@@ -1246,6 +1265,8 @@ Drive the failing test first.
 						: [],
 				},
 				ui: {
+					// RPC mode defines ui.custom as a no-op that resolves undefined.
+					custom: async () => undefined,
 					select: async (_title: string, items: string[]) => { choices = items; return undefined; },
 					notify: (message: string) => warnings.push(message),
 				},

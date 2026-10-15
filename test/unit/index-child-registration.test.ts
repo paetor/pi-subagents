@@ -644,12 +644,12 @@ describe("subagent extension child mode", () => {
 		}
 	});
 
-	it("mounts an initially collapsed async widget when configured", () => {
+	it("mounts the async widget with its configured fold and layout", () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-async-widget-collapsed-config-"));
 		try {
 			const configDir = path.join(agentDir, "extensions", "subagent");
 			fs.mkdirSync(configDir, { recursive: true });
-			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncWidgetCollapsed: true }), "utf-8");
+			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncWidgetCollapsed: true, asyncWidgetLayout: "rows" }), "utf-8");
 			const script = String.raw`
 				import registerSubagentExtension from "./index.ts";
 				const eventHandlers = new Map();
@@ -679,6 +679,9 @@ describe("subagent extension child mode", () => {
 				const component = widget({ requestRender() {} }, ctx.ui.theme);
 				const lines = component.render(120);
 				if (lines.length !== 1) throw new Error("configured collapsed widget must render one line: " + JSON.stringify(lines));
+				component.handleMouse({ type: "click", button: "left", y: 0, shift: false, alt: false, ctrl: false });
+				const unfolded = component.render(120);
+				if (unfolded.length !== 2 || !unfolded[0].includes("Async agents")) throw new Error("configured rows layout must render a header and one line for the run: " + JSON.stringify(unfolded));
 				for (const handler of handlers.get("session_shutdown")) await handler();
 			`;
 			const env = parentToolEnv(agentDir);
@@ -1341,6 +1344,69 @@ describe("subagent extension child mode", () => {
 		);
 	});
 
+	it("renders every message pi-subagents shows in main as a one-line [subagent] block", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			const events = { on() { return () => {}; }, emit() {} };
+			const messageRenderers = [];
+			const entryRenderers = [];
+			const fakePi = new Proxy({
+				events,
+				registerTool() {},
+				registerCommand() {},
+				registerShortcut() {},
+				registerMessageRenderer(type, renderer) { messageRenderers.push([type, renderer]); },
+				registerEntryRenderer(type, renderer) { entryRenderers.push([type, renderer]); },
+				sendMessage() {},
+				getSessionName() { return undefined; },
+			}, {
+				get(target, prop) {
+					if (prop in target) return target[prop];
+					return () => undefined;
+				},
+			});
+			registerSubagentExtension(fakePi);
+			const theme = { fg: (_token, text) => text, bg: (_token, text) => text, bold: (text) => text };
+			const shown = (component) => component.render(120).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd()).filter((line) => line.trim());
+			const blocks = { messages: [], entries: [] };
+			for (const [type, renderer] of messageRenderers) {
+				if (type.startsWith("subagent-slash")) continue;
+				blocks.messages.push([type, shown(renderer({ role: "custom", customType: type, content: "Saved text", display: true, timestamp: 1 }, { expanded: false, outputPad: 1 }, theme))]);
+			}
+			for (const [type, renderer] of entryRenderers) blocks.entries.push([type, shown(renderer({ type: "custom", customType: type, data: undefined }, { expanded: false }, theme))]);
+			console.log(JSON.stringify({ messageTypes: messageRenderers.map(([type]) => type).sort(), entryTypes: entryRenderers.map(([type]) => type).sort(), blocks }));
+		`;
+
+		const output = JSON.parse(execFileSync(
+			process.execPath,
+			["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script],
+			{ cwd: projectRoot, env: parentToolEnv(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+		).trim().split("\n").at(-1)!) as { messageTypes: string[]; entryTypes: string[]; blocks: { messages: Array<[string, string[]]>; entries: Array<[string, string[]]> } };
+
+		assert.deepEqual(output.messageTypes, [
+			"subagent-completion-unanswered",
+			"subagent-completion-unhandled",
+			"subagent-incremental-child-notify",
+			"subagent-notify",
+			"subagent-slash-result",
+			"subagent-slash-text-result",
+			"subagent-supervisor-blocked",
+			"subagent-supervisor-unanswered",
+			"subagent-wait-subscription",
+			"subagent-workflow-result-write-failed",
+			"subagent_control_notice",
+			"subagent_steering_notice",
+			"subagent_supervisor_request",
+			"subagent_watchdog_clarification",
+			"subagent_watchdog_warning",
+		]);
+		assert.deepEqual(output.entryTypes, ["subagent_supervisor_reply", "subagent_watchdog_warning"]);
+		for (const [type, lines] of [...output.blocks.messages, ...output.blocks.entries]) {
+			assert.equal(lines.length, 1, type);
+			assert.match(lines[0]!, /^ \[subagent\] .+ \(click to expand\)$/, type);
+		}
+	});
+
 	it("returns before registering anything in a child-hosting process", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
@@ -1499,7 +1565,7 @@ describe("subagent extension child mode", () => {
 			const list = await registeredTool.execute("list-check", { action: "list" }, new AbortController().signal, undefined, ctx);
 			if (list.isError) throw new Error("list should be allowed: " + JSON.stringify(list.content));
 			await assert.rejects(
-				registeredTool.execute("create-check", { action: "create", config: { name: "x" } }, new AbortController().signal, undefined, ctx),
+				registeredTool.execute("create-check", { action: "create", options: { config: { name: "x" } } }, new AbortController().signal, undefined, ctx),
 				/not available from child-safe subagent fanout mode/,
 			);
 			await assert.rejects(
@@ -1507,7 +1573,7 @@ describe("subagent extension child mode", () => {
 				/not available from child-safe subagent fanout mode/,
 			);
 			await assert.rejects(
-				registeredTool.execute("grant-check", { action: "grant-spawn-budget", additional: 1 }, new AbortController().signal, undefined, { ...ctx, hasUI: true }),
+				registeredTool.execute("grant-check", { action: "grant-spawn-budget", options: { additional: 1 } }, new AbortController().signal, undefined, { ...ctx, hasUI: true }),
 				/root interactive parent session/,
 			);
 		`;

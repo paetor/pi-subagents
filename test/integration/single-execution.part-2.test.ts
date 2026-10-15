@@ -68,6 +68,7 @@ import { createWorkflowChildPermit, workflowChildPermitConsumed } from "../../sr
 import { toSubagentDelegationExecutionParams, toSubagentDelegationUpdate } from "../../src/slash/delegation-adapters.ts";
 import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
+import { ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
 
 describe("single sync execution", { skip: !available ? "pi packages not available" : undefined }, () => {
 	installSingleExecutionHooks();
@@ -824,6 +825,128 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(mockPi.callCount(), 2);
 	});
 
+	for (const mode of ["single", "workflow"] as const) {
+		it(`stops a detached ${mode} foreground child when its runtime is replaced and reports it as stopped`, { timeout: 30_000 }, async () => {
+			const agentDir = process.env.PI_CODING_AGENT_DIR!;
+			fs.mkdirSync(path.join(agentDir, "agents"), { recursive: true });
+			fs.writeFileSync(path.join(agentDir, "agents", "asker.md"), "---\nname: asker\ndescription: Asks its supervisor\n---\nIntercom orchestration channel: ask the supervisor before deciding.\n");
+			if (mode === "workflow") {
+				// Workflow children then run in the parent process, like the reported foreground child.
+				fs.mkdirSync(path.join(agentDir, "extensions", "subagent"), { recursive: true });
+				fs.writeFileSync(path.join(agentDir, "extensions", "subagent", "config.json"), JSON.stringify({ asyncByDefault: false }));
+			}
+			const release = path.join(tempDir, "release-child");
+			mockPi.onCall({
+				steps: [
+					{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Which path?" })] },
+					{ waitForPath: release, jsonl: [events.assistantMessage("finished after replacement")] },
+				],
+			});
+			type Handler = (event: unknown, ctx: unknown) => unknown;
+			type Tool = { execute(id: string, params: unknown, signal: AbortSignal, onUpdate: ((update: ExecutorToolResult) => void) | undefined, ctx: unknown): Promise<ExecutorToolResult> };
+			const ctx = {
+				...makeMinimalCtx(tempDir),
+				isIdle: () => false,
+				sessionManager: {
+					getSessionId: () => "replaced-runtime-session",
+					getSessionFile: () => path.join(tempDir, "replaced-runtime-session.jsonl"),
+					getEntries: () => [],
+				},
+			};
+			const startRuntime = async (reason: string) => {
+				const bus = createEventBus();
+				const handlers = new Map<string, Handler[]>();
+				let tool: Tool | undefined;
+				const pi = new Proxy({
+					events: bus,
+					on(event: string, handler: Handler) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
+					registerTool(definition: Tool & { name: string }) { if (definition.name === "subagent") tool = definition; },
+					sendMessage() {},
+					getSessionName() { return undefined; },
+				}, { get: (target, prop) => prop in target ? target[prop as keyof typeof target] : () => undefined });
+				const previousChildEnv = process.env[SUBAGENT_CHILD_ENV];
+				delete process.env[SUBAGENT_CHILD_ENV];
+				try {
+					registerSubagentExtension(pi as never);
+				} finally {
+					if (previousChildEnv !== undefined) process.env[SUBAGENT_CHILD_ENV] = previousChildEnv;
+				}
+				for (const handler of handlers.get("session_start") ?? []) await handler({ reason }, ctx);
+				assert.ok(tool, "subagent tool registered");
+				return { bus, tool, shutDown: async (shutdownReason: string) => { for (const handler of handlers.get("session_shutdown") ?? []) await handler({ reason: shutdownReason }, ctx); } };
+			};
+
+			const first = await startRuntime("startup");
+			let detachAccepted = false;
+			first.bus.on(INTERCOM_DETACH_RESPONSE_EVENT, (payload) => { detachAccepted ||= (payload as { accepted?: unknown }).accepted === true; });
+			const detachTimer = setInterval(() => { if (!detachAccepted) first.bus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "replace-detach" }); }, 10);
+			let runId: string | undefined;
+			try {
+				if (mode === "single") {
+					const launched = await first.tool.execute("detach-before-replace", { agent: "asker", task: "Ask, then finish", async: false }, new AbortController().signal, undefined, ctx);
+					assert.equal(launched.details.results[0]?.detached, true, launched.content[0]?.text);
+					runId = launched.details.runId;
+				} else {
+					const started = await first.tool.execute("workflow-before-replace", { workflow: "parallel", args: { tasks: [{ agent: "asker", task: "Ask, then finish" }] }, async: true }, new AbortController().signal, undefined, ctx);
+					assert.ok(started.details.asyncDir, started.content[0]?.text);
+					const deadline = Date.now() + 10_000;
+					while ((!detachAccepted || !runId) && Date.now() < deadline) {
+						await new Promise((resolve) => setTimeout(resolve, 20));
+						runId = (JSON.parse(fs.readFileSync(path.join(started.details.asyncDir, "status.json"), "utf-8")) as AsyncStatus).steps?.[0]?.runId;
+					}
+					assert.equal(detachAccepted, true, "the workflow child detached");
+				}
+			} finally {
+				clearInterval(detachTimer);
+			}
+			assert.ok(runId);
+
+			// The child's pending question to its supervisor, as contact_supervisor writes it.
+			const channelDir = resolveSupervisorChannelDir(runId, "asker", 0);
+			ensureSupervisorChannelDir(channelDir);
+			const requestFile = path.join(channelDir, "requests", "replace-question.json");
+			fs.writeFileSync(requestFile, JSON.stringify({
+				type: "subagent.supervisor.request", id: "replace-question", createdAt: Date.now(), expiresAt: Date.now() + 60_000,
+				reason: "need_decision", message: "Which path?", expectsReply: true,
+				orchestratorSessionId: "replaced-runtime-session", runId, agent: "asker", childIndex: 0,
+			}));
+			await first.shutDown("reload");
+			const second = await startRuntime("reload");
+			try {
+				const status = await second.tool.execute("status-after-replace", { action: "status", id: runId }, new AbortController().signal, undefined, ctx);
+				const statusText = status.content[0]?.text ?? "";
+				assert.match(statusText, /asker: Ask, then finish stopped/);
+				assert.match(statusText, /runtime that ran it was replaced/);
+				assert.equal(fs.existsSync(requestFile), false, "the stopped child's pending supervisor request is inactive");
+
+				fs.writeFileSync(release, "release");
+				const child = mockPi.sessions[0];
+				assert.equal(child?.aborted, true, "the detached child was aborted");
+				// The aborted child's own result replaces the record after it settles; it must still say stopped.
+				const settleDeadline = Date.now() + 10_000;
+				while (!child?.settled && Date.now() < settleDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+				await new Promise((resolve) => setTimeout(resolve, 200));
+				const history = JSON.parse(fs.readFileSync(path.join(DIRS.results, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string; children: Array<{ status: string; error?: string }> }> };
+				const recorded = history.runs.find((run) => run.runId === runId)?.children[0];
+				assert.equal(recorded?.status, "stopped");
+				assert.match(recorded?.error ?? "", /runtime that ran it was replaced/);
+				assert.doesNotMatch(JSON.stringify(child?.session?.messages ?? []), /finished after replacement/);
+
+				mockPi.onCall({ output: "resumed after replacement" });
+				const resumed = await second.tool.execute("resume-after-replace", { action: "resume", id: runId, message: "Continue from where you stopped.", async: true }, new AbortController().signal, undefined, ctx);
+				assert.equal(resumed.isError, undefined, resumed.content[0]?.text);
+				assert.match(resumed.content[0]?.text ?? "", new RegExp(`Revived foreground subagent from ${runId}`));
+				const resultFile = path.join(DIRS.results, `${resumed.details.asyncId}.json`);
+				const deadline = Date.now() + 20_000;
+				while (!fs.existsSync(resultFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+				assert.ok(fs.existsSync(resultFile), "the revived run finished");
+			} finally {
+				await second.shutDown("quit");
+				fs.rmSync(channelDir, { recursive: true, force: true });
+			}
+		});
+	}
+
 	it("routes registered structured text delegation through the concurrent executor", async () => {
 		const literalJsonText = '{"looks":"json"}';
 		mockPi.onCall({
@@ -1008,7 +1131,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 						},
 					}],
 				},
-				{ jsonl: [{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "call-1", toolName: "read", isError: false, content: [] } }] },
+				{ jsonl: [{ type: "message_end", message: { role: "toolResult", toolCallId: "call-1", toolName: "read", isError: false, content: [] } }] },
 				{
 					jsonl: [{
 						type: "message_end",
@@ -1605,8 +1728,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		mockPi.onCall({
 			stdoutRaw: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true, note: "captured" } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true, note: "captured" },
 		});
@@ -1782,13 +1905,13 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		const firstSchema = { type: "object", required: ["first"], properties: { first: { type: "boolean" } } };
 		const firstEvents = [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { first: true } } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			{ type: "tool_execution_end", toolName: "structured_output" },
+			{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 		];
 		const resumedEvents = [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			{ type: "tool_execution_end", toolName: "structured_output" },
+			{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 		];
 		mockPi.onCall({ stdoutRaw: firstEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { first: true } });
 		mockPi.onCall({ stdoutRaw: resumedEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true } });
@@ -1922,8 +2045,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		fs.writeFileSync(agentPath, definition("ok"));
 		const structuredEvents = [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			{ type: "tool_execution_end", toolName: "structured_output" },
+			{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 		];
 		mockPi.onCall({ stdoutRaw: structuredEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true }, writeFiles: [{ path: agentPath, content: definition("changed") }] });
 		mockPi.onCall({ stdoutRaw: structuredEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true } });
@@ -2036,8 +2159,12 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 
 		assert.equal(resumedResult.isError, undefined, resumedResult.content[0]?.text ?? "workflow failed");
 		const resumed = resumedResult.details.results[0];
-		assert.match(resumed?.finalOutput ?? "", new RegExp(`Output saved to: ${escapeRegExp(configuredOutput)}`));
-		assert.equal(fs.readFileSync(configuredOutput, "utf-8"), "resumed report");
+		// The resume keeps the recorded file-only contract but writes its own report, never over the first run's.
+		assert.ok(resumed?.savedOutputPath && resumed.savedOutputPath !== configuredOutput, resumed?.savedOutputPath);
+		assert.match(resumed?.finalOutput ?? "", new RegExp(`^Output saved to: ${escapeRegExp(resumed.savedOutputPath)} `));
+		assert.doesNotMatch(resumed?.finalOutput ?? "", /resumed report/, "file-only keeps the report out of the inline output");
+		assert.equal(fs.readFileSync(resumed.savedOutputPath, "utf-8"), "resumed report");
+		assert.equal(fs.readFileSync(configuredOutput, "utf-8"), "first report");
 	});
 
 	it("preserves successful no-edit foreground resume output and transcript metadata", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -2109,8 +2236,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		mockPi.onCall({
 			stdoutRaw: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true }, acceptanceReport } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },
 			structuredOutputAcceptanceReport: acceptanceReport,
@@ -2148,8 +2275,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		mockPi.onCall({
 			stdoutRaw: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },
 		});
@@ -2195,8 +2322,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			stdoutRaw: [
 				events.assistantMessage(`done\n\`\`\`acceptance-report\n${JSON.stringify(acceptanceReport)}\n\`\`\``),
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },
 		});
@@ -2216,11 +2343,11 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 	});
 
 	it("accepts recovered tool errors before valid structured output but rejects later errors", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
-		const recoveredError = { type: "tool_result_end", message: { role: "toolResult", toolName: "read", isError: true, content: [{ type: "text", text: "EISDIR" }] } };
+		const recoveredError = { type: "message_end", message: { role: "toolResult", toolName: "read", isError: true, content: [{ type: "text", text: "EISDIR" }] } };
 		const structuredEvents = [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			{ type: "tool_execution_end", toolName: "structured_output" },
+			{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 		];
 		mockPi.onCall({
 			stdoutRaw: [recoveredError, ...structuredEvents].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
@@ -2269,8 +2396,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		const rejectedEvents = [
 			{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "structured-rejected", name: "structured_output", arguments: { value: {} } }], model: "mock/test-model", stopReason: "toolUse", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
 			{ type: "tool_execution_start", toolCallId: "structured-rejected", toolName: "structured_output", args: { value: {} } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "structured-rejected", toolName: "structured_output", isError: true, content: [{ type: "text", text: "Structured output validation failed: ok: is required" }] } },
 			{ type: "tool_execution_end", toolCallId: "structured-rejected", toolName: "structured_output" },
+			{ type: "message_end", message: { role: "toolResult", toolCallId: "structured-rejected", toolName: "structured_output", isError: true, content: [{ type: "text", text: "Structured output validation failed: ok: is required" }] } },
 		];
 		mockPi.onCall({ stdoutRaw: rejectedEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n" });
 		const executor = makeExecutor([makeAgent("echo")]);
@@ -2304,8 +2431,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		mockPi.onCall({
 			jsonl: [
 				{ type: "tool_execution_start", toolCallId: "structured-malformed-schema", toolName: "structured_output", args: { value: "value" } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "structured-malformed-schema", toolName: "structured_output", isError: true, content: [{ type: "text", text: `Structured output validation failed: ${validation.message}` }] } },
 				{ type: "tool_execution_end", toolCallId: "structured-malformed-schema", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolCallId: "structured-malformed-schema", toolName: "structured_output", isError: true, content: [{ type: "text", text: `Structured output validation failed: ${validation.message}` }] } },
 			],
 		});
 
@@ -2374,8 +2501,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 					},
 				},
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },
 		});
@@ -2452,7 +2579,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 
 		assert.equal(result.exitCode, 1);
 		assert.match(result.error ?? "", /^Unknown agent: nonexistent\nEffective cwd: /);
-		assert.match(result.error ?? "", /Consulted agent-definition directories:[\s\S]*Discovered agents:/);
+		assert.match(result.error ?? "", /Consulted agent-definition directories:[\s\S]*Available agents:/);
 		assert.doesNotMatch(result.error ?? "", /echo \(project\)/);
 		assert.equal(result.task, "[prompt redacted]");
 		assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
@@ -2514,6 +2641,34 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(failureEvent?.currentPath, "src/runs/background/async-status.ts");
 		assert.match(failureEvent?.recentFailureSummary ?? "", /No exact match/);
 		assert.equal(result.progress.activityState, "needs_attention");
+		assert.equal(result.messages?.filter((message) => message.role === "toolResult").length, 3, "each tool result is recorded once");
+	});
+
+	it("records a parallel batch's mutating failure against the failed call's path", async () => {
+		// Pi's parallel tool execution: every start and end comes before the result messages.
+		const result = (toolCallId: string, isError: boolean, text: string) => ({ type: "message_end", message: { role: "toolResult", toolCallId, toolName: "edit", isError, content: [{ type: "text", text }] } });
+		mockPi.onCall({
+			jsonl: [
+				{ type: "tool_execution_start", toolCallId: "edit-a", toolName: "edit", args: { path: "src/a.ts" } },
+				{ type: "tool_execution_start", toolCallId: "edit-b", toolName: "edit", args: { path: "src/b.ts" } },
+				{ type: "tool_execution_end", toolCallId: "edit-a", toolName: "edit", isError: true },
+				{ type: "tool_execution_end", toolCallId: "edit-b", toolName: "edit", isError: false },
+				result("edit-a", true, "No exact match found for a.ts"),
+				result("edit-b", false, "Edited src/b.ts"),
+				events.assistantMessage("Edit A failed."),
+			],
+		});
+		const controlEvents: NonNullable<RunSyncResult["controlEvents"]> = [];
+
+		await runSync(tempDir, [makeAgent("worker")], "worker", "Edit both files", {
+			runId: "run-parallel-failure",
+			controlConfig: { enabled: true, failedToolAttemptsBeforeAttention: 1, notifyOn: ["active_long_running", "needs_attention"] },
+			onControlEvent: (event: NonNullable<RunSyncResult["controlEvents"]>[number]) => controlEvents.push(event),
+		});
+
+		const failureEvent = controlEvents.find((event) => event.reason === "tool_failures");
+		assert.equal(failureEvent?.currentPath, "src/a.ts");
+		assert.equal(failureEvent?.recentFailureSummary, "edit(src/a.ts): No exact match found for a.ts");
 	});
 
 	it("does not surface control state or events when control is disabled", async () => {
@@ -2635,6 +2790,28 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		// overwritten by the first message_end event only if result.model is unset.
 		// Since agent has model config, it stays as the configured value.
 		assert.equal(result.model, "anthropic/claude-sonnet-4");
+	});
+
+	it("qualifies a foreground child's reported model with its provider", async () => {
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Done" }],
+					provider: "anthropic",
+					model: "claude-haiku-4-5",
+					stopReason: "stop",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
+				},
+			}],
+		});
+		// No agent model is configured, so result.model starts unset and is taken
+		// from the first assistant message, which reports the model id alone.
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { acceptance: false });
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.model, "anthropic/claude-haiku-4-5");
 	});
 
 	it("fails when a configured provider-qualified model starts on a different child model", async () => {
@@ -3652,7 +3829,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(fs.existsSync(path.join(tempDir, "context.md")), false);
 	});
 
-	it("makes task-level output overrides authoritative in the child system prompt", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("delivers the authoritative output override in the task and keeps it out of the child system prompt", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "override report" });
 		const overridePath = path.join(tempDir, "custom-report.md");
 		const executor = makeExecutor([
@@ -3675,10 +3852,23 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		const systemPrompt = call.systemPrompts[0]?.text ?? "";
 		assert.equal(result.isError, undefined);
 		assert.match(taskArg, new RegExp(`Write your findings to exactly this path: ${escapeRegExp(overridePath)}`));
+		assert.match(taskArg, /Ignore any other output filename or output path mentioned elsewhere/);
 		assert.match(systemPrompt, /Output format \(`default-report\.md`\):/);
-		assert.match(systemPrompt, /Runtime output path override:/);
-		assert.match(systemPrompt, new RegExp(`Write your findings to exactly this path: ${escapeRegExp(overridePath)}`));
-		assert.match(systemPrompt, /Ignore any other output filename or output path mentioned elsewhere/);
+		assert.doesNotMatch(systemPrompt, new RegExp(escapeRegExp(overridePath)));
+
+		// A later stage of the same agent with a new output path keeps the same system prompt, so its prompt cache survives.
+		mockPi.onCall({ output: "second report" });
+		const secondPath = path.join(tempDir, "second-report.md");
+		await executor.execute(
+			"single-output-override-system-prompt-2",
+			{ agent: "researcher", task: "Write report", output: secondPath },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		const second = readCall();
+		assert.match(resolveMockPiCallArgs(second).at(-1) ?? "", new RegExp(`Write your findings to exactly this path: ${escapeRegExp(secondPath)}`));
+		assert.equal(second.systemPrompts[0]?.text ?? "", systemPrompt);
 	});
 
 	it("persists read-only file-only output without requiring a child write tool", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -3703,12 +3893,11 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(result.isError, undefined);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "complete read-only analysis");
 		assert.match(result.content[0]?.text ?? "", /Output saved to:/);
-		for (const instruction of [taskArg, systemPrompt]) {
-			assert.match(instruction, /Return the complete artifact in your final response\./);
-			assert.match(instruction, /runtime will persist it to exactly this path:/);
-			assert.match(instruction, /Do not call contact_supervisor merely because no write-capable tool is available\./);
-			assert.doesNotMatch(instruction, /Write your findings to exactly this path/);
-		}
+		assert.match(taskArg, /Return the complete artifact in your final response\./);
+		assert.match(taskArg, /runtime will persist it to exactly this path:/);
+		assert.match(taskArg, /Do not call contact_supervisor merely because no write-capable tool is available\./);
+		assert.doesNotMatch(taskArg, /Write your findings to exactly this path/);
+		assert.doesNotMatch(systemPrompt, /runtime will persist it to exactly this path:/);
 	});
 
 	it("treats string false as disabled output in foreground single runs", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

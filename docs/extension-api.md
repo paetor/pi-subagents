@@ -19,7 +19,7 @@ registerWorkflowResource({
 }): { dispose(): void }
 ```
 
-Names are case-sensitive, at most 128 characters, and match `[A-Za-z0-9][A-Za-z0-9._-]*`; use an extension prefix. Versions are positive safe integers. Registration throws for invalid input, protected builtins (`review`, `run-ci`, and `chain` and `tasks`, which back the tool's structured inputs), or duplicate names within the same session. Different sessions may register the same name. Dispose before replacement; there is no silent overwrite.
+Names are case-sensitive, at most 128 characters, and match `[A-Za-z0-9][A-Za-z0-9._-]*`; use an extension prefix. Versions are positive safe integers. Registration throws for invalid input, protected builtins (`review`, `run-ci`, `parallel`, and `chain` and `tasks`, which back the tool's structured inputs), or duplicate names within the same session. Different sessions may register the same name. Dispose before replacement; there is no silent overwrite.
 
 Register in `session_start` using **`ctx.sessionManager.getSessionId()`**, not the session file path or a tool argument. Dispose in `session_shutdown`. New/resumed/forked sessions and reloads need registration from the replacement runtime's `session_start`; do not retain old `pi`/`ctx` references. The extension owns cleanup, not an automatic registration lifecycle manager. Disposal is idempotent and cannot remove a newer replacement. Missing cleanup can cause a duplicate-registration failure on reload.
 
@@ -123,7 +123,7 @@ Method notes:
 - `steer` requires an async run `id` (plus optional child `index`) and a non-empty `message`; its reply preserves the normal acknowledged-delivery result. Optional `mode` values are `steer` (default), `follow_up`, and `auto`, and receipts include `deliveryStatus: "delivered" | "queued"`. RPC steering disables the direct tool's pause-and-revive recovery in every mode so an extension keeps authority over the exact child it spawned; `ping.capabilities.nonRecoveringSteer` advertises this guarantee.
 - `resume` requires a run target and non-empty `message`. It delegates to the existing revival path, which validates current-session ownership, persisted session/recovery metadata, stopped/live state, capability ceilings, and the exclusive session lease before returning the new async run details. Callers may request a `file-only` output path for the revived result without overriding its model, tools, or budgets. `ping.capabilities.resume` advertises this seam.
 - `cost` returns the same parent-plus-child accounting `/subagent-cost` renders, as data: `{ version: 1, parent, children, childTotal, total, unresolvedAsyncChildren }`, where each usage is `{ input, output, cacheRead, cacheWrite, cost, turns }` and each child carries `label`, `agent`, `runId`, `usage`, and `sessionFile` when known. It is read-only and walks the current session branch plus existing run artifacts, so request it on your own turn boundaries (for example after `agent_settled` or an async completion wake), not on a timer. `unresolvedAsyncChildren` counts async children whose metadata could not be read; treat `childTotal` as a lower bound when it is non-zero, exactly as documented for `/subagent-cost` in [observability.md](observability.md). `ping.capabilities.cost` advertises `{ version: 1 }`.
-- `stop` targets current-session top-level async runs through the stop control channel and records a `stopped` lifecycle instead of reporting a timeout.
+- `stop` accepts current-session running or queued async runs and whole paused runs. Paused runs are sealed only with exact observed native runner-terminal proof; missing or unknown proof returns an error even if a stop request was persisted. A successful reply's `state: "stopping"` acknowledges the stop operation for the exact run, not its current lifecycle or retirement. Read status and process-terminal evidence to establish termination. Child-scoped stop remains limited to pending or running children of eligible runs; already-terminal targets are rejected.
 - `status` keeps targeted and rich requests on the executor-backed path. A request with no `id`, `runId`, `dir`, `index`, `view`, or `lines` may use the restored in-memory projections and a short summary; when the live state is missing, stale, session-mismatched, or not restored, it falls back to normal executor status. Status `view`, `lines`, and `index` are forwarded for targeted transcript/fleet requests. Successful replies retain `text`, `details`, `fleet`, and `asyncSnapshot`; the short summary intentionally omits canonical filesystem details, wait subscriptions, and budget annotations.
 
 Capability advertisements on `ping`:
@@ -140,6 +140,20 @@ Capability advertisements on `ping`:
 - `cost: { version: 1 }` — the `cost` method is available and returns the versioned report shape above.
 
 Structured delegation progress updates carry `runId` as soon as foreground execution allocates it, so a caller can retain the package-owned revival target even if its own tool turn is interrupted before the terminal response. Foreground `details.results[]` rows also include a numeric `index` that is unique within the run and stable across partial progress snapshots and the final result; use `(runId, index)` instead of row position to correlate single, counted parallel, and chain children.
+
+### Direct async launch correlation
+
+Direct async runs retain their originating `toolCallId` in status and result
+artifacts. After a lost RPC spawn reply, request `status` with
+`id: "rpc-spawn-<original-requestId>"`. The raw request UUID is not a run ID.
+Default targeted replies expose the resolved `runId` and retained `toolCallId`
+in `data.details`; older artifacts can omit the latter.
+
+Lookup uses the existing run indexes and retained artifacts. Terminal indexing
+keeps the alias after result delivery while the run's status is retained.
+Correlation is not idempotent spawn: multiple runs with one alias are ambiguous, and missing or
+expired evidence never proves that execution did not start. Do not redispatch
+on that basis.
 
 ### Fleet status DTO
 
@@ -264,6 +278,7 @@ Preflight covers ordinary single-agent launch resolution:
 - A parsed-definition digest, including system prompt and launch-affecting model, tool, skill, extension, output, and memory fields. Runtime overlays such as the Intercom bridge never change it.
 - Fresh/fork context, effective model and thinking, skill and tool resolution, direct MCP selections, runtime/configured extensions. Pass your extension's `pi` as `runtimeSnapshotHost` so `mcp:` selections resolve against Pi's built-in MCP the way a launch does. Without it, preflight cannot see built-in MCP and resolves `mcp:` selections through pi-mcp-adapter's configuration, as before.
 - Model scope allow lists accept the reserved tokens `inherit` and `scoped`; `scoped` expands to the caller-supplied `scopedModelIds` snapshot, degrading to `inherit` when it is omitted. Callers whose `modelScope.allow` uses `scoped` must pass `scopedModelIds` (the session's `/scoped-models` snapshot) alongside `parentModel`, otherwise preflight resolves it as `inherit` and may reject models the actual launch allows.
+- Pass `projectTrusted: ctx.isProjectTrusted()` to match a session that declined project trust. With `false`, project agents and project subagent settings are ignored and an explicit `agentScope: "project"` returns `restricted_agent`. It defaults to `true`.
 - The resolved Intercom bridge state (`intercomBridge.mode` and `intercomBridge.active`). An active bridge appends the bridge instruction to the child prompt and adds `contact_supervisor` to a declared tool list, exactly as execution does.
 - Artifact/session paths, async lifecycle/status/result/event/process-terminal paths, package/lifecycle versions, capability-ceiling audit data, and stable digests.
 
@@ -445,10 +460,10 @@ The async runner process does not import provider internals. It writes operation
 Inspect is the portable command and action surface for an existing async run. The public actions are:
 
 ```ts
-subagent({ action: "inspector.command", id: "<run-id>", index: 0 })
-subagent({ action: "inspector.open", id: "<run-id>", index: 0, focus: true })
-subagent({ action: "inspector.status", id: "<run-id>", index: 0 })
-subagent({ action: "inspector.close", id: "<run-id>", index: 0 })
+subagent({ action: "inspector.command", id: "<run-id>", options: { index: 0 } })
+subagent({ action: "inspector.open", id: "<run-id>", options: { index: 0, focus: true } })
+subagent({ action: "inspector.status", id: "<run-id>", options: { index: 0 } })
+subagent({ action: "inspector.close", id: "<run-id>", options: { index: 0 } })
 ```
 
 `inspector.command` returns a standalone runner command without contacting a host or writing a binding. `inspector.open` selects an available built-in or externally registered inspector plugin. `status` and `close` select the plugin that owns the run binding and report clearly when that plugin does not support the requested lifecycle action. Without an available plugin, `open` fails closed with an actionable message; ordinary launches remain headless. Closing an inspector never stops the run.
@@ -495,9 +510,9 @@ An `InspectorPlugin` supplies:
 - `owns(context)`: synchronously check whether the provider owns an inspector binding for this target.
 - Optional `status(context)` and `close(context)`: inspect or close that binding, returning the same result type. Closing an inspector must not stop the subagent.
 
-The existing dispatcher tries Herdr, then Ghostty, then external providers in
+The existing dispatcher tries Herdr, then Ghostty, then tmux, then external providers in
 registration order. Names are case-sensitive; duplicate names and the built-in
-names `herdr` and `ghostty` are rejected. A selected provider's failure is not
+names `herdr`, `ghostty`, and `tmux` are rejected. A selected provider's failure is not
 retried through another provider. Status/close use the first provider whose
 `owns` returns true; unavailable lifecycle methods remain explicit errors.
 Providers own their pane bindings and must verify ownership before closing one.
@@ -581,7 +596,17 @@ The API returns discriminated structured results with canonical project root, bi
 
 A host that embeds this extension owns whether completion wakes can be delivered at all.
 
-Ordinary async and foreground completion wakes use `registerSubagentNotify` and `sendCompletion`. They listen for completion events and deliver through `pi.sendMessage(..., { triggerTurn })`. When the parent is idle, every pi-subagents notice that should start a turn (completions, supervisor asks, control and steering notices, wait subscriptions) is instead appended without a turn, followed by one short user message, `Subagent updates above.`, sent with `pi.sendUserMessage`. Pi runs `before_agent_start` only for prompts, so this keeps extension-set system prompt sections in the woken run. A busy parent still gets the notice as a steering message. Session shutdown stops the result watcher and disposes this completion notifier. `createWaitSubscriptionManager` is separate: it is the explicit non-blocking `bg_wait` subscription path for work without native notification, not the ordinary completion wake path.
+Ordinary async and foreground completion wakes use `registerSubagentNotify` and `sendCompletion`. They listen for completion events and deliver through `pi.sendMessage(..., { triggerTurn })`. When the parent is idle, every pi-subagents notice that should start a turn (completions, supervisor asks, control and steering notices, wait subscriptions) is instead appended without a turn, followed by one user message, `PARENT_WAKE_TEXT` from `src/shared/parent-wake.ts`, sent with `pi.sendUserMessage`. Pi runs `before_agent_start` only for prompts, so this keeps extension-set system prompt sections in the woken run. A busy parent still gets the notice as a steering message. After the user aborts a parent run in a host with a UI, these notices are only appended, with no turn and no wake message, until the next parent run starts. Session shutdown stops the result watcher and disposes this completion notifier. `createWaitSubscriptionManager` is separate: it is the explicit non-blocking `bg_wait` subscription path for work without native notification, not the ordinary completion wake path.
+
+Each completion notice is a custom message with `customType: "subagent-notify"`. Its `content` is the text the model reads. Pi does not send `details` to the model, so hosts can use it to match a notice to its runs by id without parsing the text. `details.runs` has one entry per finished run, in the order of the notice. A grouped notice has several entries. Each entry has `agent` and `status` (`completed`, `failed`, `paused` or `stopped`). When known, an entry also has these fields:
+
+- `runId`: the finished run's id. For a workflow it equals `workflowRunId`.
+- `workflowRunId`: set only for workflows.
+- `childRuns`: `{ runId, workflowKey?, agent?, status }` for each workflow, chain or parallel child.
+- `childOutputs`: the per-child saved output paths of a workflow.
+- `source`, `durationMs`, `asyncDir`, `workflowReceiptPath`, `handoffPath`, and `sessionLabel` with `sessionValue` (a session file, share URL or share error).
+
+Entries can also carry other values the notice text is built from, such as `scheduleOrigin` and `watchdogBlockers`. The output previews are only in `content`.
 
 Detached children do not stop when the session does. They are the host process's children, not the session's, so the run keeps going, completes, and notifies nobody. What is lost is the notification, not the work.
 
@@ -598,6 +623,10 @@ If your host reclaims idle sessions, keep a session alive while it still has liv
 - Match `sessionId` in `status.json` against both forms. It is resolved as `getSessionFile() ?? getSessionId()`, so it is normally the parent's session *file path*, but a session that is not persisted records a bare session id instead.
 
 The symptom when this is missed is quiet and easy to misattribute: subagents appear never to report back, which looks like a fault in this extension rather than in the host that disposed the listener.
+
+## Component screens over RPC
+
+`/subagents-fleet`, `/subagents-stop` and the `/subagents` model and thinking pickers draw a `ctx.ui.custom()` component in the TUI. In every other mode they fall back to text or `ctx.ui.select`, because stock Pi RPC defines `custom()` as a no-op. A host that runs Pi in RPC mode and renders `custom()` components itself, such as pi-web, can set `PI_SUBAGENTS_COMPONENT_UI=1` in Pi's environment to get the component screens.
 
 ## Runtime files
 

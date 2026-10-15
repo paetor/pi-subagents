@@ -118,7 +118,7 @@ it("verifies a virtual-model child against its selection and keeps the dispatche
 	const session: ChildSession = {
 		subscribe(next) { listener = next; return () => {}; },
 		async prompt() {
-			listener?.({ type: "message_end", message: { ...fauxAssistantMessage("done"), model: "gpt-6.1-sol" } });
+			listener?.({ type: "message_end", message: { ...fauxAssistantMessage("done"), provider: "openai-codex", model: "gpt-6.1-sol" } });
 		},
 		async steer() {}, async followUp() {}, async abort() {}, async dispose() {},
 		messages: [], sessionId: "virtual-session", modelId: "router/auto", virtualModelId: "router/auto",
@@ -133,7 +133,7 @@ it("verifies a virtual-model child against its selection and keeps the dispatche
 	});
 	assert.equal(result.error, undefined);
 	assert.equal(result.exitCode, 0);
-	assert.equal(result.model, "gpt-6.1-sol");
+	assert.equal(result.model, "openai-codex/gpt-6.1-sol");
 });
 
 // Unfinished streamed text recovered on timeout or a thrown session error.

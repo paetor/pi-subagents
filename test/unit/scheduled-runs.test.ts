@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import nodeFs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -72,7 +74,7 @@ function context(cwd: string, sessionId = "session-a"): ExtensionContext {
 	} as unknown as ExtensionContext;
 }
 
-function harness(options: { cwd?: string; sessionId?: string; now?: number; config?: ExtensionConfig; randomId?: () => string } = {}): Harness {
+function harness(options: { cwd?: string; sessionId?: string; now?: number; config?: ExtensionConfig; randomId?: () => string; kill?: (pid: number) => boolean } = {}): Harness {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-schedule-test-"));
 	roots.push(root);
 	const project = options.cwd ?? path.join(root, "project");
@@ -89,6 +91,7 @@ function harness(options: { cwd?: string; sessionId?: string; now?: number; conf
 		randomId: options.randomId ?? (() => `id-${++id}`),
 		timers,
 		launch: (params, launchCtx) => new Promise((resolve) => launches.push({ params: params as Record<string, unknown>, ctx: launchCtx, resolve: resolve as Launch["resolve"] })) as never,
+		kill: options.kill,
 	});
 	manager.bindSession(ctx);
 	return { manager, ctx, clock, timers, launches, root };
@@ -808,6 +811,41 @@ describe("project schedule management", () => {
 		assert.equal(fs.existsSync(path.join(outside, "schedules")), false);
 	});
 
+	it("allows the home directory's own .pi symlinked outside home, but not a project's .pi linked to it", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-schedule-home-link-"));
+		roots.push(root);
+		const home = path.join(root, "home");
+		const config = path.join(root, "pi-config");
+		const project = path.join(root, "project");
+		fs.mkdirSync(home);
+		fs.mkdirSync(config);
+		fs.mkdirSync(project);
+		const linkType = process.platform === "win32" ? "junction" : "dir";
+		fs.symlinkSync(config, path.join(home, ".pi"), linkType);
+		fs.symlinkSync(config, path.join(project, ".pi"), linkType);
+		const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+		process.env.HOME = home;
+		process.env.USERPROFILE = home;
+		try {
+			const manager = () => createScheduledRunManager({
+				config: { scheduledRuns: { enabled: true } },
+				launch: async () => ({ content: [{ type: "text", text: "unused" }], details: { mode: "management", results: [] } }),
+			});
+			const homeManager = manager();
+			const ctx = context(home);
+			homeManager.bindSession(ctx);
+			const result = await homeManager.handleToolCall({ action: "schedule.create", id: "home", every: "1h", workflowScript: "return 1" }, ctx);
+			assert.equal(result.isError, undefined);
+			assert.equal(fs.existsSync(path.join(config, "subagents", "schedules", "home", "schedule.json")), true);
+			assert.throws(() => manager().bindSession(context(project)), /resolves outside the real project/);
+		} finally {
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
 	it("allows a default project schedule root through a shared Git worktree .pi symlink", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-schedule-worktree-link-"));
 		roots.push(root);
@@ -1325,5 +1363,254 @@ describe("recurring schedule execution", () => {
 		const history = await h.manager.handleToolCall({ action: "schedule.history", id: "failures" }, h.ctx);
 		assert.match(text(history), /failed_run.*async async-fail/);
 		assert.match(text(history), /failed_launch/);
+	});
+});
+
+describe("active runs whose async runner died", () => {
+	const DEAD_PID = 4242;
+	const LIVE_PID = 4343;
+	const kill = (pid: number) => {
+		if (pid === LIVE_PID) return true;
+		throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+	};
+	const script = "return runs.run('main', { agent: 'monitor' })";
+
+	function scheduleDir(h: Harness, id: string): string {
+		return path.join(scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores")), id);
+	}
+
+	function events(h: Harness, id: string): Array<{ event: string; runId?: string }> {
+		return fs.readFileSync(path.join(scheduleDir(h, id), "events.jsonl"), "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+	}
+
+	// The first fire attaches a running workflow whose status names the given runner PID.
+	async function attach(h: Harness, id: string, pid: number, create: Record<string, unknown> = { every: "1h" }): Promise<{ runId: string; asyncDir: string }> {
+		const created = await h.manager.handleToolCall({ action: "schedule.create", id, workflowScript: script, ...create }, h.ctx);
+		assert.equal(created.isError, undefined, text(created));
+		h.clock.now = nextRun(h, id);
+		h.timers.fireAll();
+		const asyncDir = path.join(h.root, `async-${id}`);
+		fs.mkdirSync(asyncDir);
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: `async-${id}`, mode: "workflow", state: "running", startedAt: h.clock.now, lastUpdate: h.clock.now, pid }), "utf-8");
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "workflow", results: [], asyncId: `async-${id}`, asyncDir } });
+		await flush();
+		const runId = JSON.parse(fs.readFileSync(path.join(scheduleDir(h, id), "schedule.json"), "utf-8")).activeRunId as string;
+		assert.ok(runId);
+		return { runId, asyncDir };
+	}
+
+	function nextRun(h: Harness, id: string): number {
+		return Date.parse(JSON.parse(fs.readFileSync(path.join(scheduleDir(h, id), "schedule.json"), "utf-8")).trigger.nextRunAt);
+	}
+
+	function receipt(h: Harness, id: string, runId: string): Record<string, unknown> {
+		return JSON.parse(fs.readFileSync(path.join(scheduleDir(h, id), "runs", `${runId}.json`), "utf-8"));
+	}
+
+	it("fails a dead runner's run on the next fire and launches that fire instead of skipping it", async () => {
+		const h = harness({ kill });
+		const { runId, asyncDir } = await attach(h, "dead", DEAD_PID);
+		h.clock.now = nextRun(h, "dead");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 2, "the due fire launches a fresh run");
+		assert.equal(receipt(h, "dead", runId).state, "failed_run");
+		assert.match(String(receipt(h, "dead", runId).error), /Async runner process 4242 exited or disappeared/);
+		assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "failed");
+		const schedule = JSON.parse(fs.readFileSync(path.join(scheduleDir(h, "dead"), "schedule.json"), "utf-8"));
+		assert.notEqual(schedule.activeRunId, runId);
+		assert.equal(fs.readFileSync(path.join(scheduleDir(h, "dead"), "active.lock"), "utf-8"), schedule.activeRunId);
+		assert.equal(schedule.trigger.nextRunAt, "2030-01-01T03:00:00.000Z", "the fire advances the interval once");
+		assert.deepEqual(events(h, "dead").filter((event) => event.event === "schedule.skipped_overlap"), []);
+		assert.equal(events(h, "dead").filter((event) => event.event === "schedule.run.started" && event.runId === schedule.activeRunId).length, 1);
+	});
+
+	it("releases a dead runner's claim when another session restores the schedule", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "restore", DEAD_PID);
+		h.manager.stop();
+		h.clock.now += 60_000;
+		const timers = new FakeTimers();
+		const next = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			now: () => h.clock.now,
+			timers,
+			kill,
+			launch: async () => ({ content: [{ type: "text", text: "unused" }], details: { mode: "management", results: [] } }),
+		});
+		next.bindSession(context(h.ctx.cwd, "session-b"));
+
+		assert.equal(receipt(h, "restore", runId).state, "failed_run");
+		assert.equal(JSON.parse(fs.readFileSync(path.join(scheduleDir(h, "restore"), "schedule.json"), "utf-8")).activeRunId, undefined);
+		assert.equal(fs.existsSync(path.join(scheduleDir(h, "restore"), "active.lock")), false);
+		assert.equal(timers.values.size, 1, "the released schedule is armed for its next fire");
+	});
+
+	it("keeps skipping while the runner is alive and its status is fresh", async () => {
+		const h = harness({ kill });
+		const { runId, asyncDir } = await attach(h, "live", LIVE_PID);
+		const lock = fs.readFileSync(path.join(scheduleDir(h, "live"), "active.lock"));
+		const status = fs.readFileSync(path.join(asyncDir, "status.json"));
+		h.clock.now = nextRun(h, "live");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 1);
+		assert.equal(receipt(h, "live", runId).state, "running");
+		assert.deepEqual(fs.readFileSync(path.join(scheduleDir(h, "live"), "active.lock")), lock);
+		assert.deepEqual(fs.readFileSync(path.join(asyncDir, "status.json")), status);
+		assert.equal(events(h, "live").filter((event) => event.event === "schedule.skipped_overlap").length, 1);
+	});
+
+	it("finds the active run by its receipt after it has left history", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "trimmed", DEAD_PID);
+		fs.writeFileSync(path.join(scheduleDir(h, "trimmed"), "history.json"), JSON.stringify({ schemaVersion: 1, runs: [] }), "utf-8");
+		h.clock.now = nextRun(h, "trimmed");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 2);
+		assert.equal(receipt(h, "trimmed", runId).state, "failed_run");
+	});
+
+	it("keeps a lock another session took after releasing the dead run", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "raced", DEAD_PID);
+		fs.writeFileSync(path.join(scheduleDir(h, "raced"), "active.lock"), "other-run", "utf-8");
+		h.clock.now = nextRun(h, "raced");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 1, "the other session's claim wins this fire");
+		assert.equal(receipt(h, "raced", runId).state, "failed_run");
+		assert.equal(fs.readFileSync(path.join(scheduleDir(h, "raced"), "active.lock"), "utf-8"), "other-run");
+	});
+
+	it("keeps an overdue occurrence when a restore releases a dead runner's claim", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "overdue", DEAD_PID, { every: "1h", catchUp: "latest" });
+		h.manager.stop();
+		h.clock.now = nextRun(h, "overdue") + 60_000;
+		const timers = new FakeTimers();
+		let launched = 0;
+		const next = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			now: () => h.clock.now,
+			timers,
+			kill,
+			launch: () => { launched++; return new Promise(() => {}); },
+		});
+		next.bindSession(context(h.ctx.cwd, "session-b"));
+
+		assert.equal(receipt(h, "overdue", runId).state, "failed_run");
+		assert.deepEqual(events(h, "overdue").filter((event) => event.event === "schedule.skipped_overlap"), []);
+		timers.fireAll();
+		await flush();
+		assert.equal(launched, 1, "the overdue occurrence fires after the restore");
+	});
+
+	it("arms a restored schedule when recording its released dead run fails", async () => {
+		const h = harness({ kill });
+		await attach(h, "locked", DEAD_PID);
+		h.manager.stop();
+		h.clock.now += 60_000;
+		// Another process holds the history.json lease, so recording the released run times out.
+		const lease = path.join(fs.realpathSync(scheduleDir(h, "locked")), "history.json.write-lock");
+		fs.mkdirSync(lease);
+		fs.writeFileSync(path.join(lease, "owner.json"), JSON.stringify({ token: "other-session", pid: process.pid, hostname: os.hostname() }));
+		const timers = new FakeTimers();
+		const next = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			now: () => h.clock.now,
+			timers,
+			kill,
+			launch: () => new Promise(() => {}),
+		});
+
+		assert.throws(() => next.bindSession(context(h.ctx.cwd, "session-b")), /Timed out waiting for another process/);
+		assert.equal(JSON.parse(fs.readFileSync(path.join(scheduleDir(h, "locked"), "schedule.json"), "utf-8")).activeRunId, undefined);
+		assert.equal(timers.values.size, 1, "the released schedule is armed despite the failed history write");
+	});
+
+	it("arms a restored schedule from disk and keeps the error when releasing its dead run cannot write the schedule", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "full", DEAD_PID);
+		h.manager.stop();
+		h.clock.now += 60_000;
+		const scheduleFile = path.join(fs.realpathSync(scheduleDir(h, "full")), "schedule.json");
+		const originalRename = nodeFs.renameSync;
+		nodeFs.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+			if (path.join(fs.realpathSync(path.dirname(String(to))), path.basename(String(to))) === scheduleFile) throw Object.assign(new Error("schedule write ENOSPC"), { code: "ENOSPC" });
+			return originalRename(from, to);
+		}) as typeof fs.renameSync;
+		syncBuiltinESMExports();
+		const timers = new FakeTimers();
+		let launched = 0;
+		const next = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			now: () => h.clock.now,
+			timers,
+			kill,
+			launch: () => { launched++; return new Promise(() => {}); },
+		});
+		try {
+			assert.throws(() => next.bindSession(context(h.ctx.cwd, "session-b")), (error: NodeJS.ErrnoException) => error.code === "ENOSPC");
+		} finally {
+			nodeFs.renameSync = originalRename;
+			syncBuiltinESMExports();
+		}
+		assert.equal(JSON.parse(fs.readFileSync(scheduleFile, "utf-8")).activeRunId, runId);
+		assert.equal(timers.values.size, 1, "the still-claimed schedule is armed so its next fire retries the release");
+
+		h.clock.now = nextRun(h, "full");
+		timers.fireAll();
+		await flush();
+		assert.equal(receipt(h, "full", runId).state, "failed_run");
+		assert.equal(launched, 1);
+	});
+
+	it("leaves another session's newer claim alone when it released the dead run first", async () => {
+		let h: Harness;
+		const otherSessionClaims = (pid: number) => {
+			// Session A releases the dead run and claims this occurrence while this fire reconciles it.
+			const file = path.join(scheduleDir(h, "shared"), "schedule.json");
+			fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf-8")), activeRunId: "run-a" }), "utf-8");
+			fs.writeFileSync(path.join(scheduleDir(h, "shared"), "active.lock"), "run-a", "utf-8");
+			return kill(pid);
+		};
+		h = harness({ kill: otherSessionClaims });
+		const { runId } = await attach(h, "shared", DEAD_PID);
+		h.clock.now = nextRun(h, "shared");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 1, "this session launches nothing");
+		assert.equal(JSON.parse(fs.readFileSync(path.join(scheduleDir(h, "shared"), "schedule.json"), "utf-8")).activeRunId, "run-a");
+		assert.equal(fs.readFileSync(path.join(scheduleDir(h, "shared"), "active.lock"), "utf-8"), "run-a");
+		assert.equal(receipt(h, "shared", runId).state, "running", "the session that released the run records its failure");
+		assert.equal(h.timers.values.size, 1, "the schedule stays armed");
+	});
+
+	it("advances a calendar schedule once when the recovered fire launches", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "calendar", DEAD_PID, { every: "day", at: "09:00", timezone: "Asia/Taipei" });
+		assert.equal(new Date(h.clock.now).toISOString(), "2030-01-01T01:00:00.000Z");
+		h.clock.now = nextRun(h, "calendar");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 2);
+		assert.equal(receipt(h, "calendar", runId).state, "failed_run");
+		const trigger = JSON.parse(fs.readFileSync(path.join(scheduleDir(h, "calendar"), "schedule.json"), "utf-8")).trigger;
+		assert.equal(trigger.nextLocalDate, "2030-01-03");
+		assert.equal(trigger.nextRunAt, "2030-01-03T01:00:00.000Z");
+		assert.equal(events(h, "calendar").filter((event) => event.event === "schedule.run.started").length, 2, "one started event per launched fire");
+		assert.deepEqual(events(h, "calendar").filter((event) => event.event === "schedule.skipped_overlap"), []);
 	});
 });

@@ -67,6 +67,8 @@ export interface ChildSessionLaunch {
 	/** Logical names resolved only by the remote ambient package. */
 	remoteResources?: { agent: string; skills?: string[]; toolCeiling?: string[]; reads?: string[] | false };
 	storage: ChildSessionStorage;
+	/** The launching session's file, recorded as the new child session's `parentSession` header like Pi's forks. */
+	parentSessionFile?: string;
 	/** Model reference as the agent config names it (`provider/id`, optionally `:thinking`). */
 	model?: string;
 	/** Explicit tool allowlist; undefined keeps pi's defaults. */
@@ -117,6 +119,8 @@ export interface ChildSession {
 	readonly sessionFile: string | undefined;
 	readonly sessionId: string;
 	readonly modelId: string | undefined;
+	/** Provider id of the selected model when this child inherited that provider from the parent's registry instead of loading its extension. */
+	readonly inheritedProvider?: string;
 	/** Live provider/id of the selected model when Pi marks it virtual (`api === "pi-virtual"`); assistant messages then name the dispatched physical model. */
 	readonly virtualModelId?: string;
 	readonly contextWindow?: number;
@@ -162,7 +166,8 @@ type ModelRuntimeInstance = Awaited<ReturnType<PiCodingAgentModule["ModelRuntime
 
 export type ParentProviderRegistry = Pick<ModelRuntimeInstance, "getRegisteredProviderIds" | "getRegisteredProviderConfig" | "getRegisteredNativeProvider">;
 
-function inheritParentProviders(modelRuntime: ModelRuntimeInstance, parentProviders: ParentProviderRegistry, claimedProviderIds: ReadonlySet<string>, onError: ((error: ChildSessionExtensionError) => void) | undefined): boolean {
+/** Registers the parent's providers this child did not claim itself and returns their ids. */
+function inheritParentProviders(modelRuntime: ModelRuntimeInstance, parentProviders: ParentProviderRegistry, claimedProviderIds: ReadonlySet<string>, onError: ((error: ChildSessionExtensionError) => void) | undefined): Set<string> {
 	let providerIds: readonly string[];
 	try {
 		providerIds = parentProviders.getRegisteredProviderIds();
@@ -170,7 +175,7 @@ function inheritParentProviders(modelRuntime: ModelRuntimeInstance, parentProvid
 		onError?.({ extensionPath: "<parent-providers>", event: "inherit_provider", error });
 		throw new Error(`Failed to enumerate parent providers: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	}
-	let registered = false;
+	const inherited = new Set<string>();
 	for (const providerId of new Set(providerIds)) {
 		if (claimedProviderIds.has(providerId)) continue;
 		try {
@@ -179,28 +184,26 @@ function inheritParentProviders(modelRuntime: ModelRuntimeInstance, parentProvid
 			if (native) modelRuntime.registerNativeProvider(native);
 			else if (config) modelRuntime.registerProvider(providerId, config);
 			else throw new Error(`Parent provider '${providerId}' has no registered native provider or config.`);
-			registered = true;
+			inherited.add(providerId);
 		} catch (error) {
 			onError?.({ extensionPath: `<parent-provider:${providerId}>`, event: "inherit_provider", error });
 			throw new Error(`Failed to inherit parent provider '${providerId}': ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 		}
 	}
-	return registered;
+	return inherited;
 }
 
 const CHILD_PROMPT_RUNTIME_EXTENSION_PATH = "<inline:pi-subagents:prompt-runtime>";
+const CHILD_PROMPT_BOUNDARY_EXTENSION_PATH = "<inline:pi-subagents:prompt-boundary>";
 
 /** The prompt runtime filters parent-only context before ambient extensions inspect
- *  the child prompt. Other inline hooks keep their normal position after ambient
- *  extensions, and ambient extension order stays unchanged. */
-function prioritizeChildPromptRuntime<T extends { extensions: Array<{ path: string }> }>(result: T): T {
-	const index = result.extensions.findIndex(({ path }) => path === CHILD_PROMPT_RUNTIME_EXTENSION_PATH);
-	if (index <= 0) return result;
-	const extensions = [...result.extensions];
-	const [promptRuntime] = extensions.splice(index, 1);
-	if (!promptRuntime) return result;
-	extensions.unshift(promptRuntime);
-	return { ...result, extensions };
+ *  the child prompt, and the boundary hook appends the child boundary after every
+ *  extension has added its prompt sections. Every other extension keeps its order. */
+function orderChildPromptHooks<T extends { extensions: Array<{ path: string }> }>(result: T): T {
+	const runtime = result.extensions.filter(({ path }) => path === CHILD_PROMPT_RUNTIME_EXTENSION_PATH);
+	const boundary = result.extensions.filter(({ path }) => path === CHILD_PROMPT_BOUNDARY_EXTENSION_PATH);
+	const others = result.extensions.filter(({ path }) => path !== CHILD_PROMPT_RUNTIME_EXTENSION_PATH && path !== CHILD_PROMPT_BOUNDARY_EXTENSION_PATH);
+	return { ...result, extensions: [...runtime, ...others, ...boundary] };
 }
 
 /** Ambient bash overrides keep their original backend and priority. */
@@ -468,7 +471,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					api.registerTool(commands.wrap(pi.createBashTool(launch.cwd, { commandPrefix: settingsManager.getShellCommandPrefix(), shellPath: settingsManager.getShellPath() }) as unknown as ToolDefinition));
 					api.registerTool(commands.tool());
 				} }] : []), ...codemode, ...(builtinMcp ? [builtinMcp] : [])],
-				extensionsOverride: (result) => prioritizeChildPromptRuntime(prioritizeChildCommandRuntime(result)),
+				extensionsOverride: (result) => orderChildPromptHooks(prioritizeChildCommandRuntime(result)),
 				...(launch.systemPrompt !== undefined ? { systemPrompt: launch.systemPrompt } : {}),
 				...(launch.appendSystemPrompt !== undefined ? { appendSystemPrompt: [launch.appendSystemPrompt] } : {}),
 			});
@@ -488,6 +491,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					session.dispose();
 				}
 			};
+			let inheritedProviders = new Set<string>();
 			const open = async () => {
 				const requiredPaths = new Set((launch.requiredExtensions ?? []).map(({ path }) => path));
 				applyProcessEnv(launch.processEnv);
@@ -497,10 +501,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					? loader.getExtensions().errors.filter(({ path }) => requiredPaths.has(path)) : [];
 				if (loadErrors.length > 0) throw new Error(`Required child extension failed to load: ${loadErrors.map(({ path, error }) => `${path}: ${error}`).join("; ")}`);
 				const queued = flushQueuedProviderRegistrations(loader, modelRuntime, launch.onExtensionError, requiredPaths);
-				const inherited = launch.parentProviderRegistry
-					? inheritParentProviders(modelRuntime, launch.parentProviderRegistry, queued.claimedProviderIds, launch.onExtensionError)
-					: false;
-				if (queued.registered || inherited) {
+				if (launch.parentProviderRegistry) inheritedProviders = inheritParentProviders(modelRuntime, launch.parentProviderRegistry, queued.claimedProviderIds, launch.onExtensionError);
+				if (queued.registered || inheritedProviders.size > 0) {
 					try {
 						await modelRuntime.refresh({ allowNetwork: false });
 					} catch (error) {
@@ -508,13 +510,19 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 						throw new Error(`Failed to refresh child providers: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 					}
 				}
+				const newSessionOptions = launch.parentSessionFile ? { parentSession: launch.parentSessionFile } : undefined;
+				const newSessionFile = launch.storage.kind === "file" && !fs.existsSync(launch.storage.sessionFile);
 				const sessionManager = launch.storage.kind === "file"
 					? pi.SessionManager.open(launch.storage.sessionFile, undefined, launch.cwd)
 					: launch.storage.kind === "dir"
-						? pi.SessionManager.create(launch.cwd, launch.storage.sessionDir)
+						? pi.SessionManager.create(launch.cwd, launch.storage.sessionDir, newSessionOptions)
 						: launch.storage.kind === "memory"
-							? pi.SessionManager.inMemory(launch.cwd)
-							: pi.SessionManager.create(launch.cwd);
+							? pi.SessionManager.inMemory(launch.cwd, newSessionOptions)
+							: pi.SessionManager.create(launch.cwd, undefined, newSessionOptions);
+				// SessionManager.open takes no parent for a file it is about to create, so set it on the
+				// header Pi writes with the first assistant message. Forked and resumed files keep theirs.
+				const header = newSessionFile && launch.parentSessionFile ? sessionManager.getHeader() : null;
+				if (header) header.parentSession = launch.parentSessionFile;
 				await applyCredentialContext(modelRuntime, sessionManager, launch.credentialContext);
 				const resolvedModel = launch.model
 					? pi.resolveCliModel({ cliModel: launch.model, modelRuntime })
@@ -598,6 +606,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				get sessionFile() { return session.sessionFile; },
 				get sessionId() { return session.sessionId; },
 				get modelId() { return session.model ? `${session.model.provider}/${session.model.id}` : undefined; },
+				get inheritedProvider() { return session.model && inheritedProviders.has(session.model.provider) ? session.model.provider : undefined; },
 				get virtualModelId() { return session.model?.api === "pi-virtual" ? `${session.model.provider}/${session.model.id}` : undefined; },
 				get contextWindow() { return session.model?.contextWindow; },
 			};

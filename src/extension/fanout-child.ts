@@ -4,18 +4,19 @@ import * as path from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "../agents/agents.ts";
 import { getArtifactsDir } from "../shared/artifacts.ts";
-import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
+import { createSubagentExecutor } from "../runs/foreground/subagent-executor.ts";
 import { resolveWaitToolConfig } from "../runs/background/wait-config.ts";
 import type { ChildRuntimeConfig } from "../runs/shared/child-runtime-config.ts";
-import { readNestedControlRequests, resolveInheritedNestedRoute, type NestedRoute, writeNestedControlResult } from "../runs/shared/nested-events.ts";
+import { nestedRunNotActiveMessage, readNestedControlRequests, resolveInheritedNestedRoute, type NestedRoute, writeNestedControlResult } from "../runs/shared/nested-events.ts";
 import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom.ts";
 import { createNativeSupervisorChannel, NATIVE_SUPERVISOR_TOOL_NAME, resolveSupervisorChannelDir } from "../intercom/native-supervisor-channel.ts";
 import { readStatus } from "../shared/utils.ts";
 import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { createSubagentParamsSchema } from "./schemas.ts";
+import { registerPinnedTool } from "./declaration-pinning.ts";
 import { resolveDisabledFeatureSurface } from "../shared/disabled-features.ts";
 import { finalizeToolResult } from "./tool-result.ts";
-import { removedModelWorkflowFieldError } from "./public-execution.ts";
+import { flattenSubagentToolOptions } from "./subagent-options.ts";
 import { loadConfig, resolveAsyncByDefault } from "./config.ts";
 import { SUBAGENT_ASYNC_STARTED_EVENT, type AsyncStartedEvent, type Details, type SubagentState } from "../shared/types.ts";
 import { createChildExternalJobBridgeSweeper } from "../runs/shared/external-job-bridge.ts";
@@ -95,7 +96,7 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState,
 							try {
 								const control = state.foregroundControls.get(request.targetRunId);
 								if (!control) {
-									message = `Nested run ${request.targetRunId} is not active in this fanout child.`;
+									message = nestedRunNotActiveMessage(request.targetRunId);
 								} else if (request.action === "interrupt") {
 									ok = control.interrupt?.() === true;
 									message = ok
@@ -228,13 +229,11 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, c
 		].join("\n"),
 		parameters: params,
 		async execute(id, params, signal, onUpdate, ctx) {
-			const removedField = removedModelWorkflowFieldError(params);
-			if (removedField) throw new Error(removedField);
-			return finalizeToolResult(await executor.executePublic(id, params as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx));
+			return finalizeToolResult(await executor.executePublic(id, flattenSubagentToolOptions(params, disabledFeatures), signal ?? new AbortController().signal, onUpdate, ctx));
 		},
 	};
 
-	pi.registerTool(tool);
+	registerPinnedTool(pi, tool);
 	const bridgeSweeper = createChildExternalJobBridgeSweeper();
 	const unsubscribeBridgeStarted = pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, (payload: unknown) => {
 		const info = payload as AsyncStartedEvent;
