@@ -10,6 +10,7 @@ import { resultFilePath, resultPayloadFileForSessionRun, resultPayloadPathForSes
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
 import { SUBAGENT_STOPPED_MESSAGE, readStatus } from "../../shared/utils.ts";
 import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
+import { ownsRun } from "../shared/run-ownership.ts";
 
 function getAsyncStopTarget(
 	state: SubagentState,
@@ -133,7 +134,7 @@ export function stopAsyncRun(
 	state: SubagentState,
 	runId: string | undefined,
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean,
-	location?: { asyncDir: string | null; resolvedId?: string },
+	location?: { asyncDir: string | null; resolvedId?: string; reattachedRunId?: string },
 	childId?: string,
 ): AgentToolResult<Details> | null {
 	const target = getAsyncStopTarget(state, runId, location);
@@ -151,7 +152,8 @@ export function stopAsyncRun(
 	}
 	if (!target) return null;
 	const status = reconcileAsyncRun(target.asyncDir, { kill }).status;
-	if (state.currentSessionId && status?.sessionId !== state.currentSessionId) {
+	// A workflow relaunched with options.reuseFrom stops the exact child run it re-attached, whichever session launched it.
+	if (state.currentSessionId && !ownsRun(state.currentSessionId, status?.sessionId) && location?.reattachedRunId !== target.asyncId) {
 		return {
 			content: [{ type: "text", text: `Async run '${target.asyncId}' was not found in the active session.` }],
 			isError: true,

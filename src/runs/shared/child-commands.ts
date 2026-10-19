@@ -40,6 +40,10 @@ export function readChildCommandState(channelDir: string): ChildCommandState | u
 	try { return JSON.parse(fs.readFileSync(childCommandStatePath(channelDir), "utf8")) as ChildCommandState; }
 	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 }
+/** True when the child's native command controller manages `toolCallId`, so command controls can target that call. */
+export function retainsChildCommand(channelDir: string, toolCallId: string): boolean {
+	return readChildCommandState(channelDir)?.commands.some((command) => command.toolCallId === toolCallId) === true;
+}
 function active(job: CommandJob): boolean { return job.snapshot.endedAt === undefined; }
 function text(result: AgentToolResult<unknown>): string {
 	return Buffer.from(result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")).subarray(-MAX_OUTPUT_BYTES).toString("utf8");

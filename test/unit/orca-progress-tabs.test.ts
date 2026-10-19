@@ -512,6 +512,9 @@ test("queued same-worktree creates start their timeout when the predecessor beco
 	assert.ok(second);
 	assert.ok(third);
 	await waitForFile(thirdCapture, 35_000);
+	// The capture is written before the final event and lock removal. Observe
+	// settled creates before asserting their complete ordering and cleanup.
+	await Promise.all([first.creationSettled, second.creationSettled, third.creationSettled]);
 	assert.equal(fs.existsSync(overlap), false, "same-worktree Orca create invocations overlapped");
 	const events = fs.readFileSync(order, "utf-8").trim().split("\n");
 	assert.deepEqual(events, [

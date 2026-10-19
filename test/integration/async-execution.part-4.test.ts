@@ -1213,8 +1213,10 @@ setTimeout(() => process.exit(90), 15000).unref();
 		const result = await readAsyncPayload(id);
 		assert.equal(result.success, true);
 		const rows = fs.readFileSync(path.join(ASYNC_DIR, id, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-		const attention = rows.filter((row) => row.type === "subagent.control" && row.event?.reason === "tool_open_threshold").map((row) => row.event.toolCallId);
-		assert.deepEqual(attention, ["bash-first", "bash-second"]);
+		const attention = rows.filter((row) => row.type === "subagent.control" && row.event?.reason === "tool_open_threshold");
+		assert.deepEqual(attention.map((row) => row.event.toolCallId), ["bash-first", "bash-second"]);
+		// The mock child has no native command controller, so the notice must not offer command controls.
+		for (const row of attention) assert.doesNotMatch(row.noticeText, /"action":"command\.(status|yield|cancel)"/);
 	});
 
 	it("background runs emit active-long-running control events from child turns", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

@@ -13,7 +13,8 @@ import {
 	resolveSupervisorChannelDir,
 } from "../../src/intercom/native-supervisor-channel.ts";
 import { SUPERVISOR_REPLY_ENTRY_TYPE, SUPERVISOR_REQUEST_MESSAGE_TYPE } from "../../src/intercom/supervisor-ui.ts";
-import { INTERCOM_DETACH_REQUEST_EVENT, type SubagentState } from "../../src/shared/types.ts";
+import { recordSessionReplacement } from "../../src/shared/session-succession.ts";
+import { ASYNC_DIR, INTERCOM_DETACH_REQUEST_EVENT, type SubagentState } from "../../src/shared/types.ts";
 
 const createdChannels: string[] = [];
 
@@ -248,6 +249,32 @@ describe("native supervisor channel", () => {
 		assert.equal(channel.pending.has(matchingId), false, "disposed channel clears pending requests");
 		assert.equal(channel.hasPendingRequests(), false, "disposed and foreign requests are not barriers");
 		assert.equal(sent.some(({ message }) => message.details?.id === otherId), false);
+	});
+
+	it("declares the reply tool before surfacing a request to a session that does not declare it", () => {
+		const currentSessionId = `session-${randomUUID()}`;
+		const tools = new Map<string, unknown>();
+		let active = ["read"];
+		const activeAtNotice: string[][] = [];
+		const pi = {
+			getAllTools: () => [...tools.keys()].map((name) => ({ name })),
+			registerTool: (tool: { name: string }) => { tools.set(tool.name, tool); },
+			getActiveTools: () => [...active],
+			setActiveTools: (names: string[]) => { active = [...names]; },
+			sendMessage: () => { activeAtNotice.push([...active]); },
+			getSessionName: () => "shared-name",
+		};
+		const ctx = { sessionManager: { getSessionId: () => currentSessionId, getSessionFile: () => null, getEntries: () => [] } };
+		const channel = createNativeSupervisorChannel(pi as never, makeState(currentSessionId, ctx), { platform: "darwin" });
+		try {
+			channel.start();
+			assert.deepEqual(active, ["read"], "an idle session keeps its tools");
+			writeRequest({ sessionId: currentSessionId, runId: `run-${randomUUID()}` });
+			assert.equal(channel.hasPendingRequests(), true);
+			assert.deepEqual(activeAtNotice, [["read", NATIVE_SUPERVISOR_TOOL_NAME]]);
+		} finally {
+			channel.dispose();
+		}
 	});
 
 	it("does not inject progress updates into the parent session or wake a turn", () => {
@@ -855,6 +882,52 @@ describe("native supervisor channel", () => {
 		assert.deepEqual(sent.map((message) => message.details?.id), [matchingId]);
 	});
 
+	it("lets a session answer asks from async runs of the session it replaced in this process", async () => {
+		const previousFile = path.join(os.tmpdir(), `previous-${randomUUID()}.jsonl`);
+		const currentFile = path.join(os.tmpdir(), `current-${randomUUID()}.jsonl`);
+		const currentRuntimeId = `session-${randomUUID()}`;
+		const inheritedRun = `run-${randomUUID()}`;
+		const foreignRun = `run-${randomUUID()}`;
+		for (const [runId, sessionId] of [[inheritedRun, previousFile], [foreignRun, path.join(os.tmpdir(), `other-${randomUUID()}.jsonl`)]]) {
+			fs.mkdirSync(path.join(ASYNC_DIR, runId), { recursive: true });
+			fs.writeFileSync(path.join(ASYNC_DIR, runId, "status.json"), JSON.stringify({ runId, sessionId, mode: "single", state: "running", startedAt: Date.now() }));
+			createdChannels.push(path.join(ASYNC_DIR, runId));
+		}
+		const inheritedAsk = writeRequest({ sessionId: `session-${randomUUID()}`, runId: inheritedRun, message: "Inherited question" });
+		const foreignAsk = writeRequest({ sessionId: `session-${randomUUID()}`, runId: foreignRun, message: "Foreign question" });
+		const unreadableRun = `run-${randomUUID()}`;
+		fs.mkdirSync(path.join(ASYNC_DIR, unreadableRun), { recursive: true });
+		fs.writeFileSync(path.join(ASYNC_DIR, unreadableRun, "status.json"), "{");
+		createdChannels.push(path.join(ASYNC_DIR, unreadableRun));
+		writeRequest({ sessionId: `session-${randomUUID()}`, runId: unreadableRun, message: "Unreadable question" });
+		recordSessionReplacement(currentFile, previousFile);
+		const tools = new Map<string, { execute: (_id: string, params: { action: string; replyTo?: string; message?: string }) => Promise<{ content: Array<{ text: string }> }> }>();
+		const ctx = { cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId: () => currentRuntimeId, getSessionFile: () => currentFile, getEntries: () => [] } };
+		const pi = {
+			getAllTools: () => [...tools.keys()].map((name) => ({ name })),
+			registerTool: (tool: { name: string; execute: (_id: string, params: { action: string; replyTo?: string; message?: string }) => Promise<{ content: Array<{ text: string }> }> }) => { tools.set(tool.name, tool); },
+			sendMessage: () => {},
+			appendEntry: () => {},
+			getSessionName: () => "shared-name",
+		};
+		const channel = createNativeSupervisorChannel(pi as never, makeState(currentFile, ctx));
+
+		try {
+			channel.start();
+			const pending = await tools.get(NATIVE_SUPERVISOR_TOOL_NAME)!.execute("pending", { action: "pending" });
+			assert.match(pending.content[0]!.text, /Inherited question/);
+			assert.doesNotMatch(pending.content[0]!.text, /Foreign question/);
+			assert.doesNotMatch(pending.content[0]!.text, /Unreadable question/);
+
+			await tools.get(NATIVE_SUPERVISOR_TOOL_NAME)!.execute("reply", { action: "reply", replyTo: inheritedAsk, message: "Go ahead" });
+			assert.equal((JSON.parse(fs.readFileSync(replyFile(inheritedRun, inheritedAsk), "utf-8")) as { message?: string }).message, "Go ahead");
+			await assert.rejects(() => tools.get(NATIVE_SUPERVISOR_TOOL_NAME)!.execute("reply", { action: "reply", replyTo: foreignAsk, message: "No" }));
+			assert.equal(fs.existsSync(replyFile(foreignRun, foreignAsk)), false);
+		} finally {
+			channel.dispose();
+		}
+	});
+
 	it("keeps an installed intercom tool and still exposes a native supervisor reply path", async () => {
 		const currentSessionId = `session-${randomUUID()}`;
 		const runId = `run-${randomUUID()}`;
@@ -1212,5 +1285,46 @@ describe("native supervisor channel", () => {
 		);
 
 		assert.deepEqual(fs.readdirSync(path.join(channelDir, "requests")), []);
+	});
+
+	it("keeps a child waiting while its parent moves expiresAt forward, and times out once it stops", async () => {
+		process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "300";
+		const runId = `run-${randomUUID()}`;
+		const channelDir = resolveSupervisorChannelDir(runId, "worker", 0);
+		createdChannels.push(channelDir);
+		const registeredTools = new Map<string, { execute: (_id: string, params: { reason: string; message?: string }) => Promise<{ content: Array<{ text?: string }> }> }>();
+		const pi = {
+			getAllTools: () => [...registeredTools.keys()].map((name) => ({ name })),
+			registerTool: (tool: { name: string; execute: (_id: string, params: { reason: string; message?: string }) => Promise<{ content: Array<{ text?: string }> }> }) => {
+				registeredTools.set(tool.name, tool);
+			},
+		};
+		registerNativeSupervisorClient(pi as never, { channelDir, runId, agent: "worker", childIndex: 0, orchestratorSessionId: "session-parent" });
+		const requestsDir = path.join(channelDir, "requests");
+		const ask = async () => {
+			for (const file of fs.existsSync(requestsDir) ? fs.readdirSync(requestsDir) : []) fs.rmSync(path.join(requestsDir, file));
+			let settled = false;
+			const result = registeredTools.get("contact_supervisor")!.execute("contact", { reason: "need_decision", message: "Proceed?" });
+			void result.then(() => { settled = true; }, () => { settled = true; });
+			await waitForCondition(() => fs.existsSync(requestsDir) && fs.readdirSync(requestsDir).length === 1, "the request file");
+			const file = path.join(requestsDir, fs.readdirSync(requestsDir)[0]!);
+			const extendBy = (ms: number) => fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf-8")), expiresAt: Date.now() + ms }));
+			return { result, file, extendBy, settled: () => settled };
+		};
+
+		const waiting = await ask();
+		waiting.extendBy(900);
+		await new Promise((resolve) => setTimeout(resolve, 600));
+		assert.equal(waiting.settled(), false, "the child must not time out at its original deadline while the parent extends it");
+		const requestId = path.basename(waiting.file, ".json");
+		fs.writeFileSync(path.join(channelDir, "replies", `${requestId}.json`), JSON.stringify({ type: "subagent.supervisor.reply", requestId, createdAt: Date.now(), message: "Go ahead" }));
+		assert.match((await waiting.result).content[0]?.text ?? "", /Go ahead/);
+
+		const abandoned = await ask();
+		abandoned.extendBy(400);
+		const started = Date.now();
+		await assert.rejects(abandoned.result, /Timed out waiting for supervisor reply/);
+		const waited = Date.now() - started;
+		assert.ok(waited >= 300 && waited < 1500, `a parent that stops extending lets the child time out at the last deadline (waited ${waited} ms)`);
 	});
 });

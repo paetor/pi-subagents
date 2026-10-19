@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fsDefault, * as fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
@@ -10,7 +11,9 @@ import { createResultWatcher as createRawResultWatcher } from "../../src/runs/ba
 import { collectWaitCompletions } from "../../src/runs/background/wait-completions.ts";
 import registerSubagentNotify from "../../src/runs/background/notify.ts";
 import { createResultDeliveryOwnership } from "../../src/runs/background/result-delivery-ownership.ts";
-import { writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
+import { recordSessionReplacement } from "../../src/shared/session-succession.ts";
+import { missionObserverIndexPath, resultPayloadPathForMissionObserverRun, writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
+import { tryLease } from "../../src/shared/file-lease.ts";
 import { encodeIndexSegment, MAX_INDEX_SEGMENT_BYTES } from "../../src/runs/background/index-segment.ts";
 import { createScheduledRunManager, scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
 import { prepareMissionLaunch, writeMissionAsyncBinding } from "../../src/missions/lifecycle.ts";
@@ -251,7 +254,7 @@ describe("result watcher", () => {
 			});
 			try {
 				watcher.startResultWatcher();
-				assert.equal(ownership.claimPredecessor("session-old", "session-old"), true);
+				recordSessionReplacement("session-new", "session-old");
 				state.currentSessionId = "session-new";
 				watcher.transitionResultDelivery();
 				writeIndexedResult(path.join(resultsDir, "old-run.json"), { id: "old-run", sessionId: "session-old", success: true, summary: "old" });
@@ -459,6 +462,52 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("observes an unowned mission result once, and not at all once its observer index is gone", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-mission-once-"));
+		const resultsDir = path.join(root, "results");
+		const asyncDir = path.join(root, "async-child");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		fs.mkdirSync(path.join(root, "project"), { recursive: true });
+		try {
+			const binding = prepareMissionLaunch({
+				params: { mission: { title: "Earlier runtime" }, task: "Run async child" },
+				projectRoot: path.join(root, "project"),
+				config: { directory: path.join(root, "missions"), globalIndexDir: path.join(root, "global-index") },
+				ownerSessionId: "session-current",
+			});
+			assert.ok(binding);
+			writeMissionAsyncBinding(asyncDir, binding);
+			// Same session, but written by a runtime that no longer exists.
+			const write = (runId: string) => writeAsyncResultFile(path.join(resultsDir, `${runId}.json`), {
+				id: runId, runId, sessionId: "session-current", completionOwnerId: "earlier-runtime", asyncDir, mode: "single", state: "complete", success: true, summary: "done",
+			});
+			write("indexed-run");
+			write("unindexed-run");
+			fs.rmSync(missionObserverIndexPath(resultsDir, "unindexed-run"));
+			const observed: string[] = [];
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				observeCompletion: (data) => { observed.push(String(data.runId)); },
+				observedCompletionRunIds: () => [],
+			});
+			try {
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => !fs.existsSync(missionObserverIndexPath(resultsDir, "indexed-run"))), true);
+				watcher.primeExistingResults();
+				watcher.primeExistingResults();
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			} finally {
+				watcher.stopResultWatcher();
+			}
+			assert.deepEqual(observed, ["indexed-run"]);
+			assert.equal(fs.existsSync(path.join(resultsDir, "indexed-run.json")), true);
+			assert.equal(fs.existsSync(path.join(resultsDir, "unindexed-run.json")), true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("observes a hash-only mission result once when its public alias is unaddressable", async (t) => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-mission-enametoolong-"));
 		const resultsDir = path.join(root, "results");
@@ -565,6 +614,69 @@ describe("result watcher", () => {
 		} finally {
 			console.error = originalError;
 			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("retries a mission observer acknowledgement silently while a runner holds the run's result lease", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-observer-lease-"));
+		const resultsDir = path.join(root, "results");
+		const asyncDir = path.join(root, "async-child");
+		fs.mkdirSync(resultsDir, { recursive: true });
+		fs.mkdirSync(path.join(root, "project"), { recursive: true });
+		fs.mkdirSync(asyncDir, { recursive: true });
+		const originalError = console.error;
+		const errors: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+			const binding = prepareMissionLaunch({
+				params: { mission: { title: "Lease mission" }, task: "Run async child" },
+				projectRoot: path.join(root, "project"),
+				config: { directory: path.join(root, "missions"), globalIndexDir: path.join(root, "global-index") },
+				ownerSessionId: "session-current",
+			});
+			assert.ok(binding);
+			writeMissionAsyncBinding(asyncDir, binding);
+			const runId = "lease-child";
+			const resultPath = path.join(resultsDir, `${runId}.json`);
+			writeIndexedResult(resultPath, { id: runId, runId, sessionId: "session-current", asyncDir, mode: "single", state: "complete", success: true, summary: "done" });
+
+			// The runner's lease, held from just before the acknowledgement until the notification is delivered.
+			const leasePath = path.join(fs.realpathSync.native(resultsDir), "result-leases", `${createHash("sha256").update(runId).digest("hex")}.write-lock`);
+			fs.mkdirSync(path.dirname(leasePath), { recursive: true });
+			let releaseLease: (() => void) | undefined;
+			let observerCalls = 0;
+			let deliveries = 0;
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				observeCompletion: () => {
+					observerCalls += 1;
+					if (observerCalls === 1) releaseLease = tryLease(leasePath);
+				},
+				notifier: {
+					deliver: async () => {
+						deliveries += 1;
+						assert.equal(resultPayloadPathForMissionObserverRun(resultsDir, runId), resultPath);
+						releaseLease?.();
+						return true;
+					},
+				},
+			});
+			try {
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+
+			assert.ok(releaseLease, "the test held the run lease during the first acknowledgement");
+			assert.equal(observerCalls, 2);
+			assert.equal(deliveries, 1);
+			assert.equal(resultPayloadPathForMissionObserverRun(resultsDir, runId), undefined);
+			assert.deepEqual(errors, []);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 

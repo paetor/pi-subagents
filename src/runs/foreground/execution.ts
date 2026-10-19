@@ -46,6 +46,7 @@ import {
 	hasEmptyTerminalAssistantResponse,
 	formatEmptyTerminalAssistantResponseError,
 	extractToolArgsPreview,
+	assistantMessageError,
 	extractTextFromContent,
 	MAX_STREAMED_RECENT_TOOLS,
 	boundStreamedRecentTools,
@@ -59,7 +60,8 @@ import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { createOrcaProgressTab, type OrcaProgressTab } from "../shared/orca-progress-tabs.ts";
 import { resolvePermissionRules } from "../shared/permissions.ts";
-import { applyThinkingSuffix, deriveForkPromptCacheKey } from "../shared/child-tool-plan.ts";
+import { applyThinkingSuffix, deriveForkPromptCacheKey, supervisorChannelDir } from "../shared/child-tool-plan.ts";
+import { retainsChildCommand } from "../shared/child-commands.ts";
 import { deriveChildSessionName } from "../../shared/child-session-name.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { qualifyModelWithProvider, resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -598,8 +600,11 @@ async function runSingleAttempt(
 				timeoutHardFinishTimer = undefined;
 			}
 		};
+		const startup = new AbortController();
 		const abortChild = (): void => {
-			if (!session || sessionSettled || lifecycleFinished) return;
+			if (sessionSettled || lifecycleFinished) return;
+			startup.abort();
+			if (!session) return;
 			void session.abort().catch(() => {
 				// The session settles through its prompt promise; abort failures are not separately actionable.
 			});
@@ -864,7 +869,7 @@ async function runSingleAttempt(
 		const mutatingFailures = createMutatingFailureState();
 		const mutatingFailureWindowMs = 5 * 60_000;
 		const currentToolDurationMs = (now: number) => progress.currentToolStartedAt ? Math.max(0, now - progress.currentToolStartedAt) : undefined;
-		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
+		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; hasCommandController?: boolean; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
 			if (!controlConfig.enabled) return false;
 			const previous = progress.activityState;
 			progress.activityState = "needs_attention";
@@ -884,6 +889,7 @@ async function runSingleAttempt(
 				toolCount: progress.toolCount,
 				currentTool: input.currentTool ?? progress.currentTool,
 				toolCallId: input.toolCallId,
+				hasCommandController: input.hasCommandController,
 				currentToolDurationMs: input.currentToolDurationMs ?? currentToolDurationMs(now),
 				currentPath: input.currentPath ?? progress.currentPath,
 				recentFailureSummary: input.recentFailureSummary,
@@ -936,11 +942,13 @@ async function runSingleAttempt(
 			if (toolAttentionTarget) {
 				toolAttentionTarget.attentionEmitted = true;
 				const durationMs = Math.max(0, now - toolAttentionTarget.startedAt);
+				const toolCallId = toolAttentionTarget.key.startsWith("id:") ? toolAttentionTarget.key.slice(3) : undefined;
 				return emitNeedsAttention(now, {
 					message: `${agent.name} has had tool '${toolAttentionTarget.tool}' open for ${Math.floor(durationMs / 1000)}s`,
 					reason: "tool_open_threshold",
 					currentTool: toolAttentionTarget.tool,
-					toolCallId: toolAttentionTarget.key.startsWith("id:") ? toolAttentionTarget.key.slice(3) : undefined,
+					toolCallId,
+					hasCommandController: Boolean(toolCallId && retainsChildCommand(supervisorChannelDir(options.runId, agent.name, options.index ?? 0), toolCallId)),
 					currentPath: toolAttentionTarget.path,
 					currentToolDurationMs: durationMs,
 				});
@@ -1129,7 +1137,7 @@ async function runSingleAttempt(
 							if (modelVerificationError && !result.error) result.error = modelVerificationError;
 						}
 					}
-					if (evt.message.errorMessage) assistantError = evt.message.errorMessage;
+					if (evt.message.errorMessage) assistantError = assistantMessageError(evt.message);
 					else if (hasToolCall && evt.message.stopReason === "toolUse") {
 						// A recovered request can finish via a terminating tool, without a text stop.
 						assistantError = undefined;
@@ -1159,7 +1167,8 @@ async function runSingleAttempt(
 					// The result message's own tool name is authoritative; the pending snapshot is only a fallback.
 					const resultToolName = (evt.message as { toolName?: unknown }).toolName;
 					const blockedTool = (typeof resultToolName === "string" && resultToolName.length > 0 ? resultToolName : undefined) ?? toolSnapshot?.tool;
-					if (options.toolBudget && isToolBudgetBlockedMessage(options.toolBudget, resultText, blockedTool)) {
+					const budgetBlocked = Boolean(options.toolBudget && isToolBudgetBlockedMessage(options.toolBudget, resultText, blockedTool));
+					if (options.toolBudget && budgetBlocked) {
 						result.toolBudgetBlocked = true;
 						result.toolBudget = toolBudgetState(
 							options.toolBudget,
@@ -1168,7 +1177,8 @@ async function runSingleAttempt(
 						);
 					}
 					appendRecentOutput(progress, resultText.split("\n").slice(-10));
-					if (toolSnapshot?.mutates && didMutatingToolFail(resultText)) {
+					// A budget block has its own signal; it is not a failing mutation.
+					if (toolSnapshot?.mutates && !budgetBlocked && didMutatingToolFail(evt.message)) {
 						recordMutatingFailure(mutatingFailures, {
 							tool: toolSnapshot.tool,
 							path: toolSnapshot.path,
@@ -1411,6 +1421,7 @@ async function runSingleAttempt(
 		void (async () => {
 			try {
 				const input = createReportedChildSessionInput(launch, shared.transcriptWriter);
+				input.signal = startup.signal;
 				const created = await childSessions.create(input);
 				if (lifecycleFinished) {
 					void created.dispose();

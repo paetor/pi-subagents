@@ -21,9 +21,10 @@ import {
 } from "../../intercom/result-intercom.ts";
 import { projectNestedRegistryForRoot, sanitizeSummary } from "../shared/nested-events.ts";
 import { resolveWatchPath } from "../../shared/utils.ts";
+import { FileLeaseBusyError } from "../../shared/file-lease.ts";
 import { recordWaitCompletion } from "./wait-completions.ts";
-import { MISSION_BINDING_FILE, syncMissionFromAsyncCompletion } from "../../missions/lifecycle.ts";
-import { acknowledgeMissionObserverSnapshot, missionObserverResultCandidateFiles, promotePendingResultFile, readResultPayload, resultCandidateFilesForSession, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, resultSnapshotReplaced, retireResultSnapshot, withResultRunLease, writeAsyncResultFile, writeResultIndexForData, type ResultSnapshot } from "./result-files.ts";
+import { syncMissionFromAsyncCompletion } from "../../missions/lifecycle.ts";
+import { acknowledgeMissionObserverSnapshot, missionObserverIndexPath, missionObserverResultCandidateFiles, promotePendingResultFile, readResultPayload, resultCandidateFilesForSession, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, resultSnapshotReplaced, retireResultSnapshot, withResultRunLease, writeAsyncResultFile, writeResultIndexForData, type ResultSnapshot } from "./result-files.ts";
 import type { CompletionNotifier, CompletionNotification } from "./notify.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
 
@@ -31,6 +32,9 @@ const WATCHER_RESTART_DELAY_MS = 3000;
 const POLL_INTERVAL_MS = 3000;
 const HEALTHY_SCAN_INTERVAL_MS = 60_000;
 const RETRY_DELAY_MS = 100;
+// Acknowledging and retiring a delivered result are retried after RETRY_DELAY_MS, so they make one
+// lease attempt instead of parking this event loop while a runner publishes the same run.
+const CLEANUP_LEASE_WAIT_MS = 0;
 const SLOW_RESULT_SCAN_MS = 500;
 
 type ResultWatcherFs = Pick<typeof fs, "existsSync" | "readFileSync" | "unlinkSync" | "readdirSync" | "mkdirSync" | "realpathSync" | "statSync" | "watch">;
@@ -106,7 +110,6 @@ type ResultFileIdentity = {
 	sessionId?: string;
 	completionOwnerId?: string;
 	runId?: string;
-	asyncDir?: string;
 };
 
 interface ResultScanStats {
@@ -133,7 +136,6 @@ function resultFileIdentity(raw: string, file: string): ResultFileIdentity {
 		sessionId: jsonStringProperty(raw, "sessionId"),
 		completionOwnerId: jsonStringProperty(raw, "completionOwnerId"),
 		runId: file.replace(/\.json$/i, ""),
-		asyncDir: jsonStringProperty(raw, "asyncDir"),
 	};
 }
 
@@ -322,7 +324,9 @@ export function createResultWatcher(
 		// files keep their existing diagnostics and compatibility behavior.
 		if (!identity.sessionId) return true;
 		if (ownsResult(identity.sessionId, identity.completionOwnerId)) return true;
-		if (identity.asyncDir && fsApi.existsSync(path.join(identity.asyncDir, MISSION_BINDING_FILE))) return true;
+		// Acknowledgment removes the observer index; gating on the mission binding instead
+		// re-ran mission sync for an unowned result on every scan.
+		if (identity.runId && fsApi.existsSync(missionObserverIndexPath(resultsDir, identity.runId))) return true;
 		if (identity.runId && (observed ?? observedRunIds()).has(identity.runId)) return true;
 		return Boolean(deps.observeCompletion && !deps.observedCompletionRunIds);
 	};
@@ -330,10 +334,10 @@ export function createResultWatcher(
 	const removeDeliveredResult = (file: string, triggerTurn: boolean, read: ResultSnapshot): void => {
 		identityCache.delete(file);
 		try {
-			if (retireResultSnapshot(publicResultPath(file), read) === "replaced") scheduleResult(file, triggerTurn);
+			if (retireResultSnapshot(publicResultPath(file), read, undefined, CLEANUP_LEASE_WAIT_MS) === "replaced") scheduleResult(file, triggerTurn);
 		} catch (error) {
 			if (isAbsentResultCandidate(error)) return;
-			console.error(`Failed to remove delivered subagent result '${publicResultPath(file)}'; will retry:`, error);
+			if (!(error instanceof FileLeaseBusyError)) console.error(`Failed to remove delivered subagent result '${publicResultPath(file)}'; will retry:`, error);
 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 		}
 	};
@@ -421,10 +425,10 @@ export function createResultWatcher(
 			}
 			if (observerSucceeded) {
 				try {
-					if (acknowledgeMissionObserverSnapshot(publicResultPath(file), read) === "replaced") rereadReplacedPayload = true;
+					if (acknowledgeMissionObserverSnapshot(publicResultPath(file), read, CLEANUP_LEASE_WAIT_MS) === "replaced") rereadReplacedPayload = true;
 				} catch (error) {
 					observerSucceeded = false;
-					console.error(`Failed to acknowledge the mission observer for '${resultPath}'; will retry:`, error);
+					if (!(error instanceof FileLeaseBusyError)) console.error(`Failed to acknowledge the mission observer for '${resultPath}'; will retry:`, error);
 				}
 			}
 			const epoch = deliveryEpoch;
