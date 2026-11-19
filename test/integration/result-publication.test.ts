@@ -305,8 +305,16 @@ describe("native runner result publication", { skip: !available ? "pi packages u
 		}) as typeof fs.watch);
 		const file = path.join(alias, "ready");
 		const ready = fileBarrier(file);
-		fs.writeFileSync(file, "");
-		await ready;
+		// FSEvents may register asynchronously. Keep generating real events
+		// until the canonical-directory watcher observes the marker.
+		const publish = () => fs.appendFileSync(file, "ready\n");
+		const timer = setInterval(publish, 25);
+		try {
+			publish();
+			await ready;
+		} finally {
+			clearInterval(timer);
+		}
 	});
 	for (const outcome of ["recovered", "retry-error"] as const) {
 		it(`keeps Darwin delivery demand until deferred indexed final result publication settles (${outcome})`, { skip: !isAsyncAvailable() ? "jiti unavailable" : undefined }, async () => {
