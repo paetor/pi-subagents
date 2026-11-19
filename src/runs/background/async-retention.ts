@@ -13,13 +13,18 @@ import { REVIVAL_ORIGIN_FILE } from "../../workflows/workflow-revival.ts";
 import { ACTIVE_RUN_INDEX_DIR } from "./active-run-index.ts";
 import { encodeIndexSegment } from "./index-segment.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
+import { recoveryDescriptorPath, runLaunchDir } from "../shared/run-launch-folder.ts";
 
-export const ASYNC_RETENTION_DAYS = 30;
+const ASYNC_RETENTION_DAYS = 30;
 export const ASYNC_RETENTION_BATCH_SIZE = 100;
 export const ASYNC_RETENTION_DELAY_MS = 60_000;
-export const ASYNC_RETENTION_TOMBSTONE_GRACE_MS = 24 * 60 * 60 * 1000;
+const ASYNC_RETENTION_TOMBSTONE_GRACE_MS = 24 * 60 * 60 * 1000;
+// A run or result whose session file still exists can be resumed, so it is kept this long
+// instead of ASYNC_RETENTION_DAYS. Session files outlive run dirs, so without a ceiling it is kept forever.
+export const RESUMABLE_RETENTION_DAYS = 90;
 
 const RETENTION_MS = ASYNC_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const RESUMABLE_RETENTION_MS = RESUMABLE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const LOCK_NAME = ".async-retention.lock";
 const CURSOR_NAME = ".async-retention-cursor.json";
 const LOG_NAME = "async-retention-maintenance.jsonl";
@@ -196,7 +201,8 @@ function hasNestedReferences(status: AsyncStatus): boolean {
 function hasResumableContract(runDir: string, status: AsyncStatus): boolean {
 	const statusSessionFiles = [status.sessionFile, ...(status.steps ?? []).map((step) => step.sessionFile)];
 	if (statusSessionFiles.some(existingRegularFile)) return true;
-	const descriptorPath = path.join(runDir, "recovery-descriptor.json");
+	// runDir may be a tombstone; the launch folder is keyed by the run id.
+	const descriptorPath = recoveryDescriptorPath(path.dirname(runDir), status.runId);
 	if (!fs.existsSync(descriptorPath)) return false;
 	const descriptor = readJson(descriptorPath);
 	if (!descriptor) return true;
@@ -306,6 +312,7 @@ function runSkipReason(input: {
 	asyncDirRoot: string;
 	resultsDir: string;
 	cutoff: number;
+	resumableCutoff: number;
 	protectedRunIds: ReadonlySet<string>;
 	waitRunIds: ReadonlySet<string>;
 }): string | undefined {
@@ -323,8 +330,9 @@ function runSkipReason(input: {
 	if (hasNestedReferences(status)) return "nested-reference";
 	if (missionReferenceBlocksReclaim(runDir, input.resultsDir, status.runId)) return "mission-reference";
 	if (hasUnresolvedRunHandoff(runDir, status)) return "handoff-reference";
-	if (hasResumableContract(runDir, status)) return "resumable";
 	const timestamp = statusTimestamp(status, runDir);
+	// Unknown ages stay protected.
+	if (hasResumableContract(runDir, status) && (timestamp === undefined || timestamp > input.resumableCutoff)) return "resumable";
 	if (timestamp === undefined) return "unknown-age";
 	if (timestamp > input.cutoff) return "recent";
 	return undefined;
@@ -370,9 +378,14 @@ async function computeProcessStartIdentity(pid: number): Promise<string | undefi
 	if (process.platform === "win32") {
 		// PowerShell takes ~0.5 s to start; a synchronous spawn would freeze the TUI.
 		const started = await new Promise<string>((resolve) => {
-			execFile("powershell.exe", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CreationDate`], { encoding: "utf-8", windowsHide: true, timeout: 5_000 }, (error, stdout) => {
-				resolve(error ? "" : stdout.trim());
-			});
+			// Node throws instead of calling back when the executable cannot be spawned at all (spawn UNKNOWN when policy blocks PowerShell).
+			try {
+				execFile("powershell.exe", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CreationDate`], { encoding: "utf-8", windowsHide: true, timeout: 5_000 }, (error, stdout) => {
+					resolve(error ? "" : stdout.trim());
+				});
+			} catch {
+				resolve("");
+			}
 		});
 		return started ? `win:${started}` : undefined;
 	}
@@ -517,6 +530,7 @@ function resultSkipReason(input: {
 	resultsDir: string;
 	maintenanceRoot: string;
 	cutoff: number;
+	resumableCutoff: number;
 	protectedRunIds: ReadonlySet<string>;
 	waitRunIds: ReadonlySet<string>;
 }): string | undefined {
@@ -531,10 +545,10 @@ function resultSkipReason(input: {
 	if (missionObserverIndexExists(input.resultsDir, runId)) return "mission-reference";
 	if (input.data.mode === "workflow" || completionMode(input.data) === "workflow" || typeof input.data.parentWorkflowRunId === "string" || typeof input.data.workflowKey === "string") return "workflow-reference";
 	if (hasUnresolvedResultHandoff(input.data)) return "handoff-reference";
-	if (resultHasResumableSession(input.data)) return "resumable";
+	const timestamp = resultTimestamp(input.data, input.candidate.path);
+	if (resultHasResumableSession(input.data) && (timestamp === undefined || timestamp > input.resumableCutoff)) return "resumable";
 	if (input.candidate.kind === "archive" && fs.existsSync(path.join(input.resultsDir, "completion-replay", `${encodeURIComponent(runId)}.json`))) return "replay-reference";
 	if (!terminalResult(input.data) && input.candidate.kind !== "replay" && input.candidate.kind !== "archive" && input.candidate.kind !== "tombstone") return "non-terminal-result";
-	const timestamp = resultTimestamp(input.data, input.candidate.path);
 	if (timestamp === undefined) return "unknown-age";
 	if (timestamp > input.cutoff) return "recent";
 	return undefined;
@@ -737,6 +751,7 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 		if (markCancelled()) return finish();
 		const protectedRunIds = new Set(options.protectedRunIds ?? []);
 		const cutoff = currentTime - retentionMs;
+		const resumableCutoff = currentTime - RESUMABLE_RETENTION_MS;
 		const cursor = readCursor(maintenanceRoot);
 		const runBudget = Math.ceil(batchSize / 2);
 		const resultBudget = batchSize - runBudget;
@@ -807,7 +822,7 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 					status = reconciliation.status ?? undefined;
 					if (reconciliation.repaired) result.repairedRuns += 1;
 				}
-				const initialReason = runSkipReason({ runDir, status, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, cutoff, protectedRunIds, waitRunIds: waitReferences.runIds });
+				const initialReason = runSkipReason({ runDir, status, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, cutoff, resumableCutoff, protectedRunIds, waitRunIds: waitReferences.runIds });
 				if (initialReason) {
 					increment(result.skipped, initialReason);
 					continue;
@@ -822,13 +837,14 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 						continue;
 					}
 					const freshWaitReferences = parseWaitRunIds(waitSubscriptionsDir);
-					const finalReason = freshWaitReferences.safe ? runSkipReason({ runDir, status, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, cutoff, protectedRunIds, waitRunIds: freshWaitReferences.runIds }) : "wait-references-unknown";
+					const finalReason = freshWaitReferences.safe ? runSkipReason({ runDir, status, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, cutoff, resumableCutoff, protectedRunIds, waitRunIds: freshWaitReferences.runIds }) : "wait-references-unknown";
 					if (finalReason) {
 						increment(result.skipped, `recheck-${finalReason}`);
 						continue;
 					}
 					mutationStateChanged = true;
 					fs.rmSync(runDir, { recursive: true });
+					fs.rmSync(runLaunchDir(options.asyncDirRoot, status!.runId), { recursive: true, force: true });
 					removeRunTombstoneMarker(maintenanceRoot, status!.runId);
 					result.reapedTombstones += 1;
 					deletedIds.push(`run-tombstone:${status!.runId}`);
@@ -846,7 +862,7 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 				}
 				const recheckStatus = readStatus(tombstone);
 				const freshWaitReferences = parseWaitRunIds(waitSubscriptionsDir);
-				const recheckReason = freshWaitReferences.safe ? runSkipReason({ runDir: tombstone, status: recheckStatus, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, cutoff, protectedRunIds, waitRunIds: freshWaitReferences.runIds }) : "wait-references-unknown";
+				const recheckReason = freshWaitReferences.safe ? runSkipReason({ runDir: tombstone, status: recheckStatus, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, cutoff, resumableCutoff, protectedRunIds, waitRunIds: freshWaitReferences.runIds }) : "wait-references-unknown";
 				if (recheckReason) {
 					if (!fs.existsSync(runDir)) {
 						fs.renameSync(tombstone, runDir);
@@ -858,6 +874,8 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 					continue;
 				}
 				fs.rmSync(tombstone, { recursive: true });
+				// Retention never deletes a workflow run, so this removes only a single run's recovery descriptor.
+				fs.rmSync(runLaunchDir(options.asyncDirRoot, status!.runId), { recursive: true, force: true });
 				removeRunTombstoneMarker(maintenanceRoot, status!.runId);
 				result.deletedRuns += 1;
 				deletedIds.push(`run:${status!.runId}`);
@@ -878,7 +896,7 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 					continue;
 				}
 				const data = readJson(candidate.path);
-				const reason = resultSkipReason({ candidate, data, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, maintenanceRoot, cutoff, protectedRunIds, waitRunIds: waitReferences.runIds });
+				const reason = resultSkipReason({ candidate, data, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, maintenanceRoot, cutoff, resumableCutoff, protectedRunIds, waitRunIds: waitReferences.runIds });
 				if (reason) {
 					increment(result.skipped, reason);
 					continue;
@@ -889,7 +907,7 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 						continue;
 					}
 					const freshWaitReferences = parseWaitRunIds(waitSubscriptionsDir);
-					const finalReason = freshWaitReferences.safe ? resultSkipReason({ candidate, data, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, maintenanceRoot, cutoff, protectedRunIds, waitRunIds: freshWaitReferences.runIds }) : "wait-references-unknown";
+					const finalReason = freshWaitReferences.safe ? resultSkipReason({ candidate, data, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, maintenanceRoot, cutoff, resumableCutoff, protectedRunIds, waitRunIds: freshWaitReferences.runIds }) : "wait-references-unknown";
 					if (finalReason) {
 						increment(result.skipped, `recheck-${finalReason}`);
 						continue;
@@ -906,7 +924,7 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 				const tombstoneCandidate = { ...candidate, path: tombstone, kind: "tombstone" as const };
 				const recheckData = readJson(tombstone);
 				const freshWaitReferences = parseWaitRunIds(waitSubscriptionsDir);
-				const recheckReason = freshWaitReferences.safe ? resultSkipReason({ candidate: tombstoneCandidate, data: recheckData, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, maintenanceRoot, cutoff, protectedRunIds, waitRunIds: freshWaitReferences.runIds }) : "wait-references-unknown";
+				const recheckReason = freshWaitReferences.safe ? resultSkipReason({ candidate: tombstoneCandidate, data: recheckData, asyncDirRoot: options.asyncDirRoot, resultsDir: options.resultsDir, maintenanceRoot, cutoff, resumableCutoff, protectedRunIds, waitRunIds: freshWaitReferences.runIds }) : "wait-references-unknown";
 				if (recheckReason) {
 					if (!fs.existsSync(candidate.path)) {
 						fs.renameSync(tombstone, candidate.path);

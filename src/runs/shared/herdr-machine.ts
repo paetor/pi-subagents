@@ -1,10 +1,12 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExternalProcessStatus, HerdrMachineReference } from "../../shared/types.ts";
+import type { ExternalProcessStatus, HerdrLocalMachineReference, HerdrMachineReference, PlacementMachineReference } from "../../shared/types.ts";
 import { getAgentDir, getProjectConfigDir } from "../../shared/utils.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_IDS, type CodeOwnedExternalCliAdapterId } from "./external-cli-contract.ts";
 import type { runExternalCli } from "./external-cli-runner.ts";
+import { herdrLocalEnv, parseHerdrEndpoint } from "./herdr-connection.ts";
+import { REX_LOCAL_MACHINE, resolveLocalLaunchCwd, resolveRexLocalPlacement } from "./rex-machine.ts";
 export { shellQuoteRemote as shellQuote } from "./herdr-connection.ts";
 
 /**
@@ -37,6 +39,8 @@ interface HerdrMachineCatalogEntry {
 interface MachineSettingsEntry {
 	cwd?: string;
 	env?: Record<string, string>;
+	/** User settings only: run this machine's children in Rex panes reached over SSH at `ssh`. */
+	rex?: { ssh: string };
 }
 
 export interface ResolveHerdrMachinePlacementInput {
@@ -54,8 +58,11 @@ export interface ResolveHerdrMachinePlacementInput {
 	herdrBin?: string;
 }
 
-export interface HerdrMachinePlacement {
-	machine: HerdrMachineReference;
+export interface HerdrMachinePlacement extends MachinePlacement { machine: HerdrMachineReference }
+
+/** A resolved `machine` value: a Herdr saved machine, a Rex SSH host, or the reserved `local` (a new tab of the Herdr or Rex session this Pi runs in). */
+export interface MachinePlacement {
+	machine: PlacementMachineReference;
 	/** Opt-in `subagents.machines.<name>.env`, exported in front of the remote command. */
 	env?: Record<string, string>;
 }
@@ -116,20 +123,14 @@ function parseMachineCatalog(json: string): HerdrMachineCatalogEntry[] {
 }
 
 function readHerdrMachineCatalog(env: NodeJS.ProcessEnv, herdrBin: string): HerdrMachineCatalogEntry[] {
-	const result = spawnSync(herdrBin, ["machine", "list", "--json"], {
-		env,
-		encoding: "utf-8",
-		maxBuffer: MAX_HERDR_MACHINE_LIST_BYTES,
-		timeout: HERDR_MACHINE_LIST_TIMEOUT_MS,
-		windowsHide: true,
-	});
-	if (result.error) {
-		const code = (result.error as NodeJS.ErrnoException).code;
-		if (code === "ENOENT") throw new Error(`Herdr CLI '${herdrBin}' was not found on PATH. Saved-machine placement needs Herdr installed locally.`);
-		throw new Error(`Failed to run herdr machine list --json: ${result.error.message}`);
-	}
-	if (result.status !== 0) throw new Error(`herdr machine list --json exited with code ${result.status}: ${(result.stderr || result.stdout).trim()}`);
-	return parseMachineCatalog(result.stdout);
+	return parseMachineCatalog(runLocalHerdr(herdrBin, ["machine", "list", "--json"], env, `Herdr CLI '${herdrBin}' was not found on PATH. Saved-machine placement needs Herdr installed locally.`));
+}
+
+function runLocalHerdr(bin: string, args: string[], env: NodeJS.ProcessEnv, notFound: string): string {
+	const result = spawnSync(bin, args, { env, encoding: "utf-8", maxBuffer: MAX_HERDR_MACHINE_LIST_BYTES, timeout: HERDR_MACHINE_LIST_TIMEOUT_MS, windowsHide: true });
+	if (result.error) throw new Error((result.error as NodeJS.ErrnoException).code === "ENOENT" ? notFound : `Failed to run herdr ${args.join(" ")}: ${result.error.message}`, { cause: result.error });
+	if (result.status !== 0) throw new Error(`herdr ${args.join(" ")} exited with code ${result.status}: ${(result.stderr || result.stdout).trim().slice(0, 512)}`);
+	return result.stdout;
 }
 
 /** Mirrors Herdr's own selector rules: profile id first, then a unique case-sensitive label; disabled fails closed. */
@@ -182,17 +183,29 @@ function machineSettingsFrom(settings: Record<string, unknown>, keys: readonly s
 			throw new Error(`Subagent settings in '${filePath}' set 'machines.${key}.env'. Saved-machine runs use the remote Herdr/Pi environment; configure credentials and environment on '${key}' and remove the local env map.`);
 		}
 	}
+	if (record.rex !== undefined) {
+		const rex = record.rex, ssh = rex && typeof rex === "object" && !Array.isArray(rex) && Object.keys(rex).every((field) => field === "ssh") ? (rex as Record<string, unknown>).ssh : undefined;
+		if (typeof ssh !== "string") throw new Error(`Subagent settings in '${filePath}' have invalid 'machines.${key}.rex'; expected { "ssh": "<ssh target>" }.`);
+		entry.rex = { ssh: validateTarget(ssh, key) };
+	}
 	return entry;
 }
 
-/** Project settings beat user settings, field by field; the entry may be keyed by label, id, or the typed selector. */
+/** Project settings beat user settings, field by field; the entry may be keyed by label, id, or the typed selector. Only user settings may name a Rex SSH host, so a cloned repo never chooses where a task runs. */
 function readMachineSettings(cwd: string, keys: readonly string[]): MachineSettingsEntry | undefined {
 	const userPath = path.join(getAgentDir(), "settings.json");
 	const projectPath = path.join(getProjectConfigDir(findProjectRootForSettings(cwd)), "settings.json");
 	const user = machineSettingsFrom(readJsonObject(userPath), keys, userPath);
 	const project = projectPath === userPath ? undefined : machineSettingsFrom(readJsonObject(projectPath), keys, projectPath);
+	if (project?.rex) throw new Error(`Project settings '${projectPath}' set a Rex SSH host in 'machines'. Move the rex entry to your user settings '${userPath}'; only user settings choose which host a task runs on.`);
 	if (!user && !project) return undefined;
 	return { ...user, ...project };
+}
+
+/** Whether user settings name `machine` as a Rex SSH host. */
+function userRexMachine(machine: string): boolean {
+	const userPath = path.join(getAgentDir(), "settings.json");
+	return machineSettingsFrom(readJsonObject(userPath), [machine], userPath)?.rex !== undefined;
 }
 
 function findProjectRootForSettings(cwd: string): string {
@@ -203,6 +216,14 @@ function findProjectRootForSettings(cwd: string): string {
 		if (parent === current) return path.resolve(cwd);
 		current = parent;
 	}
+}
+
+/** The child's cwd on a remote machine: an absolute launch cwd, or the launch cwd under the machine's configured root. */
+function remoteMachineCwd(stepCwd: string | undefined, root: string | undefined, name: string): string {
+	const step = stepCwd?.trim();
+	if (step && isRemoteAbsolute(step)) return step;
+	if (!root) throw new Error(`No root for ${name} in this repo. Set subagents.machines.${name}.cwd in .pi/settings.json or pass an absolute cwd on that machine.`);
+	return step ? path.posix.join(root, step) : root;
 }
 
 export function resolveHerdrMachinePlacement(input: ResolveHerdrMachinePlacementInput): HerdrMachinePlacement {
@@ -217,11 +238,7 @@ export function resolveHerdrMachinePlacement(input: ResolveHerdrMachinePlacement
 	if (settings?.env && Object.keys(settings.env).length > 0) {
 		throw new Error(`Saved-machine environment for '${name}' must be configured remotely. Remove machines.${name}.env and configure the remote Herdr/Pi session instead.`);
 	}
-	const stepCwd = input.stepCwd?.trim();
-	let cwd: string;
-	if (stepCwd && isRemoteAbsolute(stepCwd)) cwd = stepCwd;
-	else if (settings?.cwd) cwd = stepCwd ? path.posix.join(settings.cwd, stepCwd) : settings.cwd;
-	else throw new Error(`No root for ${name} in this repo. Set subagents.machines.${name}.cwd in .pi/settings.json or pass an absolute cwd on that machine.`);
+	const cwd = remoteMachineCwd(input.stepCwd, settings?.cwd, name);
 	return {
 		machine: {
 			provider: "herdr",
@@ -235,6 +252,40 @@ export function resolveHerdrMachinePlacement(input: ResolveHerdrMachinePlacement
 	};
 }
 
+/** Resolves `machine: "local"` inside a Herdr pane: records the server drawing this Pi (confirmed to know this pane) and the real launch directory. */
+function resolveHerdrLocalPlacement(input: { cwd: string; stepCwd?: string; env: NodeJS.ProcessEnv; herdrBin?: string }): HerdrLocalMachineReference {
+	if (process.platform === "win32") throw new Error("Machine 'local' runs the child in a Herdr pane, which is not supported on Windows.");
+	const env = input.env, paneId = env.HERDR_PANE_ID!.trim(), bin = input.herdrBin ?? env.HERDR_BIN ?? "herdr", notFound = `Machine 'local' needs the Herdr CLI, but '${bin}' was not found on PATH.`;
+	let endpoint: ReturnType<typeof parseHerdrEndpoint>;
+	try { endpoint = parseHerdrEndpoint(runLocalHerdr(bin, ["status", "server", "--json"], env, notFound), env.HERDR_SESSION); } catch (error) { throw new Error(`Machine 'local' could not confirm this pane's Herdr server: ${error instanceof Error ? error.message : String(error)}`, { cause: error }); }
+	let pane: unknown;
+	try { pane = JSON.parse(runLocalHerdr(bin, ["pane", "get", paneId], herdrLocalEnv(endpoint.socket, endpoint.session, env), notFound)); } catch (error) { throw new Error(`Machine 'local' needs this Pi's Herdr pane ${paneId}, but the Herdr server at ${endpoint.socket} did not return it: ${error instanceof Error ? error.message : String(error)}`, { cause: error }); }
+	const result = (pane as { result?: { type?: unknown; pane?: { pane_id?: unknown } } } | null)?.result;
+	if (result?.type !== "pane_info" || result.pane?.pane_id !== paneId) throw new Error(`The Herdr server at ${endpoint.socket} did not confirm pane ${paneId}.`);
+	return { provider: "herdr", id: REX_LOCAL_MACHINE, socket: endpoint.socket, ...(endpoint.session ? { session: endpoint.session } : {}), cwd: resolveLocalLaunchCwd(input.cwd, input.stepCwd) };
+}
+
+/** `local` resolves to a new tab of the terminal this Pi runs in (Herdr, else Rex); a name with a `rex` entry in user settings to a Rex pane on that SSH host; any other value to a Herdr saved machine. */
+export function resolveMachinePlacement(input: ResolveHerdrMachinePlacementInput): MachinePlacement {
+	const requested = validateMachineName(input.machine);
+	const settings = input.settings ?? readMachineSettings(input.cwd, [requested]);
+	if (requested === REX_LOCAL_MACHINE) {
+		if (settings?.rex) throw new Error("Machine 'local' is reserved for a new tab on this machine; give the Rex SSH host in subagents.machines.local.rex another name.");
+		const env = input.env ?? process.env;
+		// A Herdr pane sets both; when Herdr runs inside a Rex tab its panes also inherit REX_SESSION, and the Herdr pane is where this Pi is drawn.
+		if (env.HERDR_ENV === "1" && env.HERDR_PANE_ID?.trim()) return { machine: resolveHerdrLocalPlacement({ cwd: input.cwd, stepCwd: input.stepCwd, env, herdrBin: input.herdrBin }) };
+		if (env.REX_SESSION?.trim()) return { machine: resolveRexLocalPlacement({ cwd: input.cwd, stepCwd: input.stepCwd, env }) };
+		// Herdr Core (`hc`, the Herdr app's terminal server) is a different product from the herdr multiplexer, with a different CLI and protocol.
+		const core = env.HC_TERMINAL_ID?.trim() ? " It runs in a Herdr Core terminal (HC_TERMINAL_ID), which machine 'local' does not support." : "";
+		throw new Error(`Machine 'local' opens the child in a new tab of the terminal this Pi runs in, but this Pi is running in neither Herdr (HERDR_ENV=1 with HERDR_PANE_ID) nor Rex (REX_SESSION).${core}`);
+	}
+	if (settings?.rex) return { machine: { provider: "rex", id: requested, target: settings.rex.ssh, cwd: validateRemoteCwd(remoteMachineCwd(input.stepCwd, settings.cwd, requested), requested) } };
+	return resolveHerdrMachinePlacement(input);
+}
+
+/** A placed Pi keeps its transcript on the pane's machine, so it can't start from a local one. */
+export const PLACED_RESTORE_UNSUPPORTED = "Pane-native remote Pi does not support fork, resume, or revival; use fresh context.";
+
 export function formatHerdrMachineRunnerUnsupported(input: {
 	machine?: string;
 	agentName: string;
@@ -243,6 +294,16 @@ export function formatHerdrMachineRunnerUnsupported(input: {
 	worktree?: boolean;
 }): string | undefined {
 	if (input.machine === undefined) return undefined;
+	const name = input.machine.trim();
+	const local = name === REX_LOCAL_MACHINE;
+	let rex: boolean;
+	try { rex = local || userRexMachine(name); } catch (error) { return error instanceof Error ? error.message : String(error); }
+	if (rex) {
+		if (input.runnerType !== undefined && input.runnerType !== "pi") return `Agent '${input.agentName}' requested machine '${name}', but ${local ? "machine 'local' runs" : "Rex supports"} native Pi children only. Remove the machine or use a native Pi agent.`;
+		if (input.worktree === true) return `Agent '${input.agentName}' requested machine '${name}', but managed worktrees cannot be combined with machine placement.`;
+		if (process.platform === "win32") return `Machine '${name}' runs the child in ${local ? "a Herdr or Rex pane" : "a Rex pane"}, which is not supported on Windows.`;
+		return undefined;
+	}
 	if (input.runnerType !== undefined && input.runnerType !== "pi" && input.runnerType !== "external-cli") {
 		return `Agent '${input.agentName}' requested machine '${input.machine}', but this runner cannot use pane-native Herdr placement. Use native Pi or a built-in Claude, Codex, or Cursor profile.`;
 	}

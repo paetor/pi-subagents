@@ -48,6 +48,8 @@ function sealPausedRun(asyncDir: string, status: AsyncStatus, resultsDir: string
 			sessionId: status.sessionId,
 			asyncDir,
 			...(status.completionOwnerId ? { completionOwnerId: status.completionOwnerId } : {}),
+			...(status.completionOwnerProcess ? { completionOwnerProcess: status.completionOwnerProcess } : {}),
+			...(status.parentWorkflowRunId ? { parentWorkflowRunId: status.parentWorkflowRunId } : {}),
 			...(status.toolCallId ? { toolCallId: status.toolCallId } : {}),
 			results: (status.steps ?? []).map((step) => ({
 				agent: step.agent,
@@ -136,6 +138,7 @@ export function stopAsyncRun(
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean,
 	location?: { asyncDir: string | null; resolvedId?: string; reattachedRunId?: string },
 	childId?: string,
+	drain?: boolean,
 ): AgentToolResult<Details> | null {
 	const target = getAsyncStopTarget(state, runId, location);
 	// An async workflow runs in this process: it has no runner to read a stop request, so stop it through its controller.
@@ -145,6 +148,12 @@ export function stopAsyncRun(
 	const workflowStatus = workflowAsyncDir ? readStatus(workflowAsyncDir) : undefined;
 	// Controllers outlive a session switch; a workflow owned by another session falls through to the ownership check below.
 	const foreignWorkflow = Boolean(state.currentSessionId && workflowStatus && workflowStatus.sessionId !== state.currentSessionId);
+	if (drain) {
+		const drained = workflowController && workflowRunId && !foreignWorkflow && !workflowController.signal.aborted ? state.workflowDrains?.get(workflowRunId)?.() : undefined;
+		if (!drained) return { content: [{ type: "text", text: `drain applies only to live async workflows in this session; '${runId ?? "current"}' is not one.` }], isError: true, details: { mode: "management", results: [] } };
+		if (!drained.ok) return { content: [{ type: "text", text: `Could not save the drain request for '${workflowRunId}'; nothing was stopped. Retry, or use stop without drain.` }], isError: true, details: { mode: "management", results: [] } };
+		return { content: [{ type: "text", text: `Drain requested for async workflow ${workflowRunId}: no new children will start; ${drained.started} started child(ren) will finish.` }], details: { mode: "management", results: [] } };
+	}
 	if (workflowController && workflowRunId && !foreignWorkflow) {
 		if (workflowStatus) stopStoppableAsyncStatusChildren(workflowStatus, state.workflowChildStops?.get(workflowRunId), "Workflow stopped.");
 		workflowController.abort(new Error("Workflow stopped."));
@@ -152,7 +161,7 @@ export function stopAsyncRun(
 	}
 	if (!target) return null;
 	const status = reconcileAsyncRun(target.asyncDir, { kill }).status;
-	// A workflow relaunched with options.reuseFrom stops the exact child run it re-attached, whichever session launched it.
+	// A relaunched workflow stops the exact child run it re-attached from its relaunch chain, whichever session launched it.
 	if (state.currentSessionId && !ownsRun(state.currentSessionId, status?.sessionId) && location?.reattachedRunId !== target.asyncId) {
 		return {
 			content: [{ type: "text", text: `Async run '${target.asyncId}' was not found in the active session.` }],

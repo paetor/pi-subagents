@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import type { AssistantMessage, Message, Model, ToolResultMessage } from "@earendil-works/pi-ai";
+import { validateToolArguments, type AssistantMessage, type Message, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
+import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { createEventBus } from "../support/helpers.ts";
@@ -19,6 +20,7 @@ import { execFileSync } from "node:child_process";
 import { createNestedRoute, nestedResultsPath } from "../../src/runs/shared/nested-events.ts";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { createChildHooks } from "../../src/runs/shared/child-hooks.ts";
+import { registerBackgroundWorkProvider } from "../../src/api/background-work.ts";
 import { ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
 import { INTERCOM_SESSION_IDENTITY_EVENT, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, TEMP_ROOT_DIR, SUBAGENT_FOREGROUND_COMPLETE_EVENT, type SubagentState } from "../../src/shared/types.ts";
 import registerSubagentPromptRuntime, {
@@ -38,9 +40,21 @@ function childConfig(overrides: Partial<ChildRuntimeConfig> = {}): ChildRuntimeC
 	return { fanoutChild: false, depth: 1, waitTool: { enabled: true }, fast: false, ...overrides };
 }
 
-it("does not skip drain for in-process child sessions when hasUI is true", async () => {
+function registerChild(ctx: unknown, config: ChildRuntimeConfig) {
 	const handlers = new Map<string, Function[]>();
 	const listeners = new Map<string, Array<() => void>>();
+	registerSubagentPromptRuntime({
+		on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]),
+		registerTool: () => {},
+		events: { on: (channel: string, handler: () => void) => { listeners.set(channel, [...(listeners.get(channel) ?? []), handler]); return () => {}; } },
+	} as never, config);
+	return {
+		emit: async (name: string, event: unknown = {}) => { for (const fn of handlers.get(name) ?? []) await fn(event, ctx); },
+		wake: (channel: string) => { for (const handler of listeners.get(channel) ?? []) handler(); },
+	};
+}
+
+it("does not skip drain for in-process child sessions when hasUI is true", async () => {
 	const held: boolean[] = [];
 	const sessionId = "reviewer-ui-session.jsonl";
 	const runtimeState = {
@@ -49,29 +63,22 @@ it("does not skip drain for in-process child sessions when hasUI is true", async
 			children: [{ agent: "reviewer", index: 0, status: "detached", updatedAt: 1 }],
 		}]]),
 	} as SubagentState;
-	const ctx = { hasUI: true, sessionManager: { getSessionFile: () => sessionId } };
-	const emit = async (name: string, event: unknown) => { for (const fn of handlers.get(name) ?? []) await fn(event, ctx); };
-	registerSubagentPromptRuntime({
-		on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]),
-		registerTool: () => {},
-		events: { on: (channel: string, handler: () => void) => { listeners.set(channel, [...(listeners.get(channel) ?? []), handler]); return () => {}; } },
-	} as never, childConfig({ runtimeState, holdFinalDrain: (value) => { held.push(value); } }));
-	await emit("session_start", {});
+	const ctx = { hasUI: true, sessionManager: { getSessionFile: () => sessionId, getSessionId: () => "reviewer-ui-session" } };
+	const { emit, wake } = registerChild(ctx, childConfig({ runtimeState, holdFinalDrain: (value) => { held.push(value); } }));
+	await emit("session_start");
 	let settled = false;
 	const ended = emit("agent_end", { messages: [] }).then(() => { settled = true; });
 	await new Promise((resolve) => setTimeout(resolve, 30));
 	assert.equal(settled, false);
 	assert.deepEqual(held, [true]);
 	runtimeState.foregroundRuns.get("fg")!.children[0]!.status = "completed";
-	for (const handler of listeners.get(SUBAGENT_FOREGROUND_COMPLETE_EVENT) ?? []) handler();
+	wake(SUBAGENT_FOREGROUND_COMPLETE_EVENT);
 	await ended;
 	assert.equal(settled, true);
 	assert.deepEqual(held, [true, false]);
 });
 
 it("reads a late-installed owner barrier for each final drain and balances the hold", async () => {
-	const handlers = new Map<string, Function[]>();
-	const listeners = new Map<string, Array<() => void>>();
 	const held: boolean[] = [];
 	const sessionId = "fanout-owner-session.jsonl";
 	const runtimeState = {
@@ -81,13 +88,8 @@ it("reads a late-installed owner barrier for each final drain and balances the h
 		}]]),
 	} as SubagentState;
 	const config = childConfig({ runtimeState, holdFinalDrain: (value) => { held.push(value); } });
-	const ctx = { hasUI: true, sessionManager: { getSessionFile: () => sessionId } };
-	const emit = async (name: string) => { for (const fn of handlers.get(name) ?? []) await fn({}, ctx); };
-	registerSubagentPromptRuntime({
-		on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]),
-		registerTool: () => {},
-		events: { on: (channel: string, handler: () => void) => { listeners.set(channel, [...(listeners.get(channel) ?? []), handler]); return () => {}; } },
-	} as never, config);
+	const ctx = { hasUI: true, sessionManager: { getSessionFile: () => sessionId, getSessionId: () => "fanout-owner-session" } };
+	const { emit, wake } = registerChild(ctx, config);
 	await emit("session_start");
 	let pending = true;
 	config.hasPendingSupervisorRequest = () => pending;
@@ -101,9 +103,33 @@ it("reads a late-installed owner barrier for each final drain and balances the h
 	await new Promise((resolve) => setTimeout(resolve, 30));
 	assert.equal(settled, false);
 	runtimeState.foregroundRuns.get("fg")!.children[0]!.status = "completed";
-	for (const handler of listeners.get(SUBAGENT_FOREGROUND_COMPLETE_EVENT) ?? []) handler();
+	wake(SUBAGENT_FOREGROUND_COMPLETE_EVENT);
 	await ended;
 	assert.deepEqual(held, [true, false, true, false]);
+});
+
+it("keeps a file-backed child's final drain waiting for provider work keyed by its session id", async () => {
+	let active = true;
+	const dispose = registerBackgroundWorkProvider({
+		name: "child-session-id",
+		wakeChannels: ["child-session-id:done"],
+		listActiveWork: () => active ? [{ id: "job", sessionId: "child-session-id" }] : [],
+	});
+	try {
+		const ctx = { hasUI: false, sessionManager: { getSessionFile: () => "/sessions/child.jsonl", getSessionId: () => "child-session-id" } };
+		const { emit, wake } = registerChild(ctx, childConfig());
+		await emit("session_start");
+		let settled = false;
+		const ended = emit("agent_end").then(() => { settled = true; });
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		assert.equal(settled, false);
+		active = false;
+		wake("child-session-id:done");
+		await ended;
+		assert.equal(settled, true);
+	} finally {
+		dispose();
+	}
 });
 
 it("does not grant nested wait access for an invalid inherited route", async (t) => {
@@ -136,7 +162,7 @@ it("registered child bg_wait discovers nested personas and agent_end drains the 
 	const events = createEventBus();
 	const tools = new Map<string, { execute: Function }>();
 	const held: boolean[] = [];
-	const ctx = { hasUI: false, sessionManager: { getSessionFile: () => sessionId } };
+	const ctx = { hasUI: false, sessionManager: { getSessionFile: () => sessionId, getSessionId: () => "nested-child-session" } };
 	const emit = async (event: string) => { for (const fn of handlers.get(event) ?? []) await fn({}, ctx); };
 	const writeStatus = (state: "running" | "complete") => {
 		fs.mkdirSync(asyncDir, { recursive: true });
@@ -533,6 +559,29 @@ describe("subagent prompt runtime", () => {
 			await execute!("valid", { value: {}, acceptanceReport: { manualNotes: "validated evidence" } });
 			assert.deepEqual(captured, [{ value: {}, acceptanceReport: { manualNotes: "validated evidence" } }]);
 		}
+	});
+
+	it("structured_output rejects a raw value before Pi's argument conversion can change it", async () => {
+		type Tool = { name: string; parameters: never; prepareArguments?: (args: unknown) => Record<string, unknown>; execute: (id: string, params: unknown) => Promise<unknown> };
+		const captured: unknown[] = [];
+		let tool: Tool | undefined;
+		const [promptRuntime] = createChildHooks(childConfig({
+			structuredOutput: {
+				schema: { type: "object", required: ["tags", "title"], properties: { tags: { type: "array", items: { type: "string" } }, title: { type: "string" } } },
+				capture: (value) => captured.push(value),
+			},
+		}));
+		await promptRuntime!.factory({ registerTool(registered: Tool) { if (registered.name === "structured_output") tool = registered; }, on() {} } as never);
+		// The order Pi's agent loop uses: prepareArguments, then validateToolArguments (which converts), then execute.
+		const call = async (value: unknown) => {
+			const args = validateToolArguments(tool!, { type: "toolCall", id: "call", name: "structured_output", arguments: tool!.prepareArguments?.({ value }) ?? { value } });
+			return tool!.execute("call", args);
+		};
+
+		await assert.rejects(call({ tags: "x", title: "t" }), /tags/);
+		await assert.rejects(call({ tags: ["x"], title: null }), /Structured output validation failed: title: /);
+		await call({ tags: ["x"], title: "t" });
+		assert.deepEqual(captured, [{ tags: ["x"], title: "t" }]);
 	});
 
 	it("captures an omitted optional acceptance report as undefined", async () => {
@@ -1183,11 +1232,30 @@ describe("subagent prompt runtime", () => {
 		assert.equal(handlers[0]!({ systemPrompt: finalized!.systemPrompt }), undefined);
 	});
 
+	it("strips subagent history without moving Pi's system messages", async () => {
+		const handlers = new Map<string, Function[]>();
+		registerSubagentPromptRuntime({
+			on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]),
+			registerTool: () => {},
+			events: { on: () => () => {} },
+		} as never, childConfig());
+		const runner = new ExtensionRunner([{ path: "child-runtime", handlers } as never], {} as never, process.cwd(), undefined as never, undefined as never);
+		const leading = { role: "system", content: "Base prompt", timestamp: 0 };
+		const task = { role: "user", content: "Task", timestamp: 1 };
+		const call = { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "subagent", arguments: {} }], timestamp: 2 };
+		const result = { role: "toolResult", toolCallId: "call_1", toolName: "subagent", content: [], isError: false, timestamp: 3 };
+		// A mid-conversation system message must stay where it is, or the cached prefix ends at the tools.
+		const sectionUpdate = { role: "system", content: "", sections: { time: "Now: 10:00" }, timestamp: 4 };
+		const next = { role: "user", content: "Continue", timestamp: 5 };
+
+		assert.deepEqual(await runner.emitContext([leading, task, call, result, sectionUpdate, next] as never), [leading, task, sectionUpdate, next]);
+	});
+
 	it("filters parent-only artifacts from polluted fork context while preserving ordinary history", () => {
 		let contextHandler: ((event: { messages: unknown[] }) => { messages: unknown[] } | undefined) | undefined;
 		registerSubagentPromptRuntime({
 			on(event: string, handler: (payload: { messages: unknown[] }) => { messages: unknown[] } | undefined) {
-				if (event === "context") contextHandler = handler;
+				if (event === "context_with_system") contextHandler = handler;
 			},
 		} as { on(event: string, handler: (payload: { messages: unknown[] }) => { messages: unknown[] } | undefined): void }, childConfig());
 
@@ -1215,7 +1283,7 @@ describe("subagent prompt runtime", () => {
 		let contextHandler: ((event: { messages: unknown[] }, ctx: { model: typeof model }) => { messages: unknown[] } | undefined) | undefined;
 		registerSubagentPromptRuntime({
 			on(event: string, handler: typeof contextHandler) {
-				if (event === "context") contextHandler = handler;
+				if (event === "context_with_system") contextHandler = handler;
 			},
 		} as never, childConfig());
 
@@ -1256,6 +1324,13 @@ describe("subagent prompt runtime", () => {
 			});
 		}
 
+		it("preserves composite ids for a custom provider on the Codex Responses wire", () => {
+			// DeepSeek's Responses endpoint rejects a call_id that is not shaped like the one it issued.
+			const messages = history("call_00_ET_9AVPsTo5MNbdb2i4IbPv5443|0a48e5ac-df6b-47c9-a133-4da6b380fa82");
+			assert.ok(contextHandler);
+			assert.equal(contextHandler({ messages }, { model: { ...model, api: "cliproxyapi-codex-responses" } } as never), undefined);
+		});
+
 		for (const [label, toolCallId] of [
 			["65-character call half", `${"a".repeat(65)}|fc_item`],
 			["65-character item half", `call_read|fc_${"b".repeat(62)}`],
@@ -1295,7 +1370,7 @@ describe("subagent prompt runtime", () => {
 		let contextHandler: ((event: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined) | undefined;
 		registerSubagentPromptRuntime({
 			on(event: string, handler: (payload: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined) {
-				if (event === "context") contextHandler = handler;
+				if (event === "context_with_system") contextHandler = handler;
 			},
 		} as { on(event: string, handler: (payload: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined): void }, childConfig());
 
@@ -1313,7 +1388,7 @@ describe("subagent prompt runtime", () => {
 		let contextHandler: ((event: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined) | undefined;
 		registerSubagentPromptRuntime({
 			on(event: string, handler: (payload: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined) {
-				if (event === "context") contextHandler = handler;
+				if (event === "context_with_system") contextHandler = handler;
 			},
 		} as { on(event: string, handler: (payload: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined): void }, childConfig());
 
@@ -1333,7 +1408,7 @@ describe("subagent prompt runtime", () => {
 		let contextHandler: ((event: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined) | undefined;
 		registerSubagentPromptRuntime({
 			on(event: string, handler: (payload: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined) {
-				if (event === "context") contextHandler = handler;
+				if (event === "context_with_system") contextHandler = handler;
 			},
 		} as { on(event: string, handler: (payload: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined): void }, childConfig());
 

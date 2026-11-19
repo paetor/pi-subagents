@@ -5,7 +5,7 @@ import { previewDisplayText } from "../../shared/display-text.ts";
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
 import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type CostSummary, type Details, type HostStepNode, type HostStepState, type LaunchResolvedChildExtensions, type RuntimeAcknowledgedChildExtensions, type NestedRunSummary, type SteeringStatus, type SubagentRunMode, type TimeoutRecoveryProjection, type TokenUsage, type TurnBudgetState, type UsageBudgetState, type WorktreeNaming, type WorkflowPreflight, type WorkflowGraphSnapshot } from "../../shared/types.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../shared/capability-ceiling.ts";
-import { readStatus } from "../../shared/utils.ts";
+import { isStatusAccessError, readStatus } from "../../shared/utils.ts";
 import { attachRootChildrenToSteps, buildNestedRouteIndex, findNestedRouteForRootId, type NestedRoute, projectNestedEvents } from "../shared/nested-events.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
@@ -60,6 +60,8 @@ interface AsyncRunStepSummary {
 	currentPath?: string;
 	recentTools?: Array<{ tool: string; args: string; endMs: number }>;
 	recentOutput?: string[];
+	progressText?: string;
+	progressUpdatedAt?: number;
 	turnCount?: number;
 	toolCount?: number;
 	steering?: SteeringStatus;
@@ -168,6 +170,12 @@ interface AsyncRunListOptions {
 	includeNested?: boolean;
 	/** Explicit repair/debug escape hatch. Normal runtime paths must not set this. */
 	repairScan?: boolean;
+	/** This process's completion owner, adopted by an owner-exited workflow repair of a run the session owns; needs `sessionId`. */
+	adoptCompletionOwnerId?: string;
+	/** Receives the warning for a skipped corrupt terminal status, so an open TUI can show it as a notice instead of console output. */
+	onCorruptStatus?: (warning: string) => void;
+	/** Receives an active run kept in the index whose status.json this process may not read. */
+	onUnreadableActiveRun?: (runId: string, asyncDir: string) => void;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -183,7 +191,12 @@ function isAsyncStatusIsolationError(asyncDir: string, error: unknown): boolean 
 		|| /^(workflowChildren|Invalid workflowChildren)/.test(message);
 }
 
-function isolateCorruptActiveRun(asyncDir: string, runId: string, error: unknown, now?: () => number): void {
+// Status path -> last logged signature. A corrupt run is re-scanned on every
+// status poll, so the line repeats only when the file or the outcome changes.
+const reportedCorruptStatus = new Map<string, string>();
+
+/** Returns whether the active-run marker is still in place. */
+function isolateCorruptActiveRun(asyncDir: string, runId: string, error: unknown, now?: () => number): boolean {
 	const statusPath = path.join(asyncDir, "status.json");
 	const processTerminal = readProcessTerminal(asyncDir, { runId });
 	let markerAge: number | undefined;
@@ -195,9 +208,11 @@ function isolateCorruptActiveRun(asyncDir: string, runId: string, error: unknown
 	const markerCanBeReleased = processTerminal?.state === "observed"
 		|| (markerAge !== undefined && markerAge > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS);
 	let markerAction = "active marker retained because runner liveness is unknown";
+	let retained = true;
 	if (markerCanBeReleased) {
 		try {
 			releaseActiveRunIndex(asyncDir);
+			retained = false;
 			markerAction = processTerminal?.state === "observed"
 				? "active marker released after observed process-terminal proof"
 				: "stale active marker released";
@@ -205,7 +220,19 @@ function isolateCorruptActiveRun(asyncDir: string, runId: string, error: unknown
 			markerAction = `failed to release active marker: ${getErrorMessage(releaseError)}`;
 		}
 	}
-	console.error(`[pi-subagents] Skipping corrupt active async run '${runId}' at '${statusPath}': ${getErrorMessage(error)}; ${markerAction}.`);
+	const line = `[pi-subagents] Skipping corrupt active async run '${runId}' at '${statusPath}': ${getErrorMessage(error)}; ${markerAction}.`;
+	let fileSignature = "";
+	try {
+		const stat = fs.statSync(statusPath);
+		fileSignature = `${stat.size}:${stat.mtimeMs}`;
+	} catch {
+		// A missing file still gets the line once; its message carries the cause.
+	}
+	const signature = `${fileSignature}\n${line}`;
+	if (reportedCorruptStatus.get(statusPath) === signature) return retained;
+	reportedCorruptStatus.set(statusPath, signature);
+	console.error(line);
+	return retained;
 }
 
 function isNotFoundError(error: unknown): boolean {
@@ -363,6 +390,8 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.currentPath ? { currentPath: step.currentPath } : {}),
 			...(step.recentTools ? { recentTools: step.recentTools.map((tool) => ({ ...tool })) } : {}),
 			...(step.recentOutput ? { recentOutput: [...step.recentOutput] } : {}),
+			...(step.progressText ? { progressText: step.progressText } : {}),
+			...(step.progressUpdatedAt !== undefined ? { progressUpdatedAt: step.progressUpdatedAt } : {}),
 			...(step.turnCount !== undefined ? { turnCount: step.turnCount } : {}),
 			...(step.toolCount !== undefined ? { toolCount: step.toolCount } : {}),
 			...(step.steering ? { steering: step.steering } : {}),
@@ -524,7 +553,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			}
 			if (wantsTerminal) {
 				for (const sessionId of owners ?? [undefined]) {
-					for (const entry of readRecentTerminalRunIndex(asyncDirRoot, { sessionId, ...(options.entryLimit !== undefined ? { limit: options.entryLimit } : {}) })) indexed.add(entry);
+					for (const entry of readRecentTerminalRunIndex(asyncDirRoot, { sessionId, onCorruptStatus: options.onCorruptStatus, ...(options.entryLimit !== undefined ? { limit: options.entryLimit } : {}) })) indexed.add(entry);
 				}
 			}
 			entries = [...indexed];
@@ -556,22 +585,25 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		let status: (AsyncStatus & { cwd?: string }) | null;
 		try {
 			// Reconciliation can rewrite state; session-scoped discovery does not own foreign runs.
+			let owned = false;
 			if (owners) {
 				const stored = readStatus(asyncDir);
 				if (stored && !owners.has(stored.sessionId)) {
 					observeStatus?.(stored);
 					continue;
 				}
+				owned = stored !== null;
 			}
+			// Only a run this session owns may adopt the caller's completion owner.
 			const reconciliation = options.reconcile === false
 				? undefined
-				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now }, observeStatus);
+				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: owned ? options.adoptCompletionOwnerId : undefined }, observeStatus);
 			status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
 			if (options.reconcile === false) observeStatus?.(status);
 		} catch (error) {
 			observeStatus?.(null);
 			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;
-			isolateCorruptActiveRun(asyncDir, entry, error, options.now);
+			if (isolateCorruptActiveRun(asyncDir, entry, error, options.now) && isStatusAccessError(error, asyncDir)) options.onUnreadableActiveRun?.(entry, asyncDir);
 			continue;
 		}
 		if (!status) {
@@ -645,6 +677,7 @@ function formatStepLine(step: AsyncRunStepSummary): string {
 	const modelThinking = formatModelThinking(step.model, step.thinking);
 	if (modelThinking) parts.push(modelThinking);
 	if (step.durationMs !== undefined) parts.push(formatDuration(step.durationMs));
+	if (step.progressText && step.status === "running") parts.push(`progress: ${step.progressText}`);
 	if (step.tokens) parts.push(`${formatTokens(step.tokens.total)} tok`);
 	if (step.lane) parts.push(`lane ${step.lane.key}`);
 	if (step.worktreePath) parts.push(`worktree ${shortenPath(step.worktreePath)} · branch ${step.branch ?? "unknown"}${step.provider ? ` · provider ${step.provider}` : ""}`);

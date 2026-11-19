@@ -98,6 +98,63 @@ afterEach(() => {
 });
 
 describe("native supervisor channel", () => {
+	it("keeps blocked-child progress silent and leaves foreign-owner asks untouched", () => {
+		const owner = randomUUID();
+		const runId = randomUUID();
+		const foreignId = randomUUID();
+		const progress = writeRequest({ sessionId: owner, runId, reason: "progress_update" });
+		const foreign = writeRequest({ sessionId: "other-owner", runId: foreignId });
+		const state = makeState(owner, { sessionManager: { getSessionId: () => owner } });
+		state.blockingWorkflowChildren = new Set([runId, foreignId]);
+		const channel = createNativeSupervisorChannel({
+			getAllTools: () => [], registerTool() {}, sendMessage() { assert.fail("neither request should wake the parent"); },
+		} as never, state);
+		try {
+			channel.start();
+			assert.equal(fs.existsSync(requestFile(runId, progress)), false);
+			assert.equal(fs.existsSync(replyFile(runId, progress)), false);
+			assert.equal(fs.existsSync(requestFile(foreignId, foreign)), true);
+			assert.equal(fs.existsSync(replyFile(foreignId, foreign)), false);
+		} finally {
+			channel.dispose();
+		}
+	});
+
+	for (const reason of ["need_decision", "interview_request"] as const) {
+		it(`fails an unanswerable ${reason} ask from an awaited background workflow child`, async () => {
+			const runId = `run-${randomUUID()}`;
+			const owner = `session-${randomUUID()}`;
+			const channelDir = resolveSupervisorChannelDir(runId, "worker", 0);
+			createdChannels.push(channelDir);
+			const tools = new Map<string, { execute(id: string, params: unknown, signal?: AbortSignal): Promise<unknown> }>();
+			const notices: unknown[] = [];
+			const pi = {
+				getAllTools: () => [...tools.keys()].map(name => ({ name })),
+				registerTool: (tool: { name: string; execute(id: string, params: unknown, signal?: AbortSignal): Promise<unknown> }) => tools.set(tool.name, tool),
+				sendMessage: (message: unknown) => { notices.push(message); return false; },
+			};
+			const state = makeState(owner, { sessionManager: { getSessionId: () => owner } });
+			state.blockingWorkflowChildren = new Set([runId]);
+			registerNativeSupervisorClient(pi as never, { channelDir, runId, agent: "worker", childIndex: 0, orchestratorSessionId: owner });
+			const channel = createNativeSupervisorChannel(pi as never, state);
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 2_000);
+			const ask = tools.get("contact_supervisor")!.execute("ask", { reason, message: "Choose an approach", ...(reason === "interview_request" ? { interview: { questions: [] } } : {}) }, controller.signal);
+			try {
+				channel.start();
+				await assert.rejects(ask, /parent is blocked.*async:false.*Report the blocker.*async:true/s);
+				assert.equal(channel.pending.size, 0);
+				assert.deepEqual(notices, [], "do not queue a question that will be unanswerable when the parent sees it");
+				assert.deepEqual(fs.readdirSync(path.join(channelDir, "requests")), []);
+			} finally {
+				clearTimeout(timeout);
+				controller.abort();
+				await ask.catch(() => {});
+				channel.dispose();
+			}
+		});
+	}
+
 	for (const platform of ["darwin", "win32", "linux"] as const) {
 		it(`bounds coordinator polling to owned channels and stops when idle (${platform})`, async () => {
 			const owner = randomUUID();
@@ -389,6 +446,75 @@ describe("native supervisor channel", () => {
 			tick!();
 			assert.deepEqual(sent.map((message) => message.details?.id), [requestId]);
 		} finally {
+			channel.dispose();
+			fsDefault.readdirSync = readdir;
+			syncBuiltinESMExports();
+		}
+	});
+
+	it("keeps the darwin poller alive when a supervisor directory scan fails, and reports the failure to demand callers", async () => {
+		const currentSessionId = `session-${randomUUID()}`;
+		const runId = `run-${randomUUID()}`;
+		const sent: Array<{ details?: { id?: string } }> = [];
+		const tools = new Map<string, { execute(id: string, params: unknown): Promise<unknown> }>();
+		let tick: (() => void) | undefined;
+		const ctx = {
+			cwd: process.cwd(), hasUI: false,
+			sessionManager: { getSessionId: () => currentSessionId, getSessionFile: () => null, getEntries: () => [] },
+		};
+		const state = makeState(currentSessionId, ctx);
+		state.foregroundControls.set("run-a", { runId: "run-a" } as never);
+		const channel = createNativeSupervisorChannel({
+			getAllTools: () => [...tools.values()],
+			registerTool: (tool: { name: string; execute(id: string, params: unknown): Promise<unknown> }) => { tools.set(tool.name, tool); },
+			sendMessage: (message: { details?: { id?: string } }) => { sent.push(message); },
+			getSessionName: () => "shared-name",
+		} as never, state, {
+			platform: "darwin",
+			timers: {
+				setInterval: ((callback: () => void) => { tick = callback; return 1; }) as never,
+				clearInterval: (() => { tick = undefined; }) as never,
+				setImmediate, clearImmediate,
+			},
+		});
+		const readdir = fsDefault.readdirSync;
+		const consoleError = console.error;
+		const consoleWarn = console.warn;
+		const reported: string[] = [];
+		const errors: string[] = [];
+
+		try {
+			channel.start();
+			channel.activateTransport();
+			assert.equal(typeof tick, "function", "darwin transport demand starts the 500ms poller");
+			let failScans = true;
+			fsDefault.readdirSync = ((dir: fs.PathLike, options?: unknown) => {
+				if (failScans) throw Object.assign(new Error("ENFILE: file table overflow, scandir '/tmp/pisub-repro/temp/supervisor-channels'"), { code: "ENFILE" });
+				return (readdir as (dir: fs.PathLike, options?: unknown) => unknown)(dir, options);
+			}) as typeof fsDefault.readdirSync;
+			syncBuiltinESMExports();
+			// Without a UI the session warning goes to console.warn.
+			console.warn = (...args: unknown[]) => { reported.push(args.map((arg) => String(arg)).join(" ")); };
+			console.error = (...args: unknown[]) => { errors.push(args.map((arg) => String(arg)).join(" ")); };
+
+			assert.doesNotThrow(() => tick!(), "a failed scan must not reach Pi's uncaughtException handler");
+			assert.equal(reported.length, 1, "the first scan failure is reported");
+			assert.match(reported[0]!, /ENFILE/);
+			assert.doesNotThrow(() => tick!(), "the next poll survives the same failure");
+			assert.equal(reported.length, 1, "repeated scan failures are reported once");
+			assert.deepEqual(errors, []);
+
+			// A failed scan is not "no pending requests" for callers whose answer a model or a drain decision reads.
+			assert.throws(() => channel.hasPendingRequests(), /ENFILE/);
+			await assert.rejects(tools.get(NATIVE_SUPERVISOR_TOOL_NAME)!.execute("pending", { action: "pending" }), /ENFILE/);
+
+			failScans = false;
+			const requestId = writeRequest({ sessionId: currentSessionId, runId });
+			assert.doesNotThrow(() => tick!());
+			assert.deepEqual(sent.map((message) => message.details?.id), [requestId]);
+		} finally {
+			console.error = consoleError;
+			console.warn = consoleWarn;
 			channel.dispose();
 			fsDefault.readdirSync = readdir;
 			syncBuiltinESMExports();
@@ -1213,7 +1339,7 @@ describe("native supervisor channel", () => {
 			assert.equal(channel.pending.has(requestId), false);
 			await assert.rejects(
 				() => registeredTools.get(NATIVE_SUPERVISOR_TOOL_NAME)!.execute("reply", { action: "reply", replyTo: requestId, message: "Too late" }),
-				new RegExp(`No pending supervisor request found for replyTo '${requestId}'`),
+				new RegExp(`Supervisor request '${requestId}' from worker \\[${runId}#0\\] was withdrawn by the child before its ask deadline \\(noticed at \\d{4}-\\d\\d-\\d\\dT[^ ]+Z\\)\\. A child withdraws its request when its run is stopped, interrupted or times out`),
 			);
 		} finally {
 			channel.dispose();

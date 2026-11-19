@@ -78,6 +78,7 @@ function createCtx(input: {
 		getSystemPrompt: () => "Parent system prompt",
 		modelRegistry: {
 			getAvailable: () => allModels.filter((entry) => authenticated.has(`${entry.provider}/${entry.id}`)),
+			getAll: () => allModels,
 			find: (provider: string, id: string) => allModels.find((entry) => entry.provider === provider && entry.id === id),
 			hasConfiguredAuth: (entry: Model<any>) => authenticated.has(`${entry.provider}/${entry.id}`),
 			getApiKeyAndHeaders: async (entry: Model<any>) => authenticated.has(`${entry.provider}/${entry.id}`)
@@ -169,6 +170,7 @@ describe("main watchdog review adapter", () => {
 
 		await createMainWatchdogReview(context, { streamFn })(request(enabledConfig(), []));
 
+		assert.equal(calls[0]?.options?.sessionId, "watchdog-review-session");
 		assert.deepEqual(calls[0]?.context.messages[0], {
 			role: "system",
 			content: [

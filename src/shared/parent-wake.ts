@@ -1,13 +1,19 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { compactionInProgress } from "./compaction-interruption.ts";
 
-export const PARENT_WAKE_TEXT = "Inspect subagent updates above. Answer pending supervisor requests within your authority. For completed work, read saved results and resume the already-authorized parent task, or report completion. If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, or infer new authorization.";
-// A handled or failed wake prompt emits no agent_start. Past this deadline an idle parent's
-// wake counts as abandoned: its notices are already in the session, only the turn is lost.
+/** Ends a waking notice that reports results. */
+export const COMPLETION_ACTION = "Read the saved results above and resume the already-authorized parent task, or report completion. If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, or infer new authorization.";
+/** Ends a waking notice that reports a problem or a run state rather than results. */
+export const STATUS_ACTION = "Check the run status and details above, then resume the already-authorized parent task or report the problem. If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, or infer new authorization.";
+
+// A wake whose run never starts emits no agent_start; past this deadline an idle parent's wake counts as abandoned.
+// Pi persists the waking notice only when its run reaches message_end, so a run that never starts loses it;
+// notify.ts records undelivered subagent-notify notices at shutdown and replays them at the next start.
 const WAKE_PENDING_MS = 10_000;
 
-// Reload replaces extension instances, not Pi's session manager or a wake prompt in preflight.
-// The key and shape are shared with pi-intercom's idle wake: Pi marks a run active only after the
-// prompt's async preflight, so a second extension's wake sent in that gap throws in agent.prompt().
+// Reload replaces extension instances, not Pi's session manager or a wake still starting.
+// The key and shape are shared with pi-intercom's idle wake: a wake prompt it sends is in
+// preflight until agent_start, and a second extension's wake must not start another run then.
 type WakeReservation = { sessionId: string; sentAt?: number };
 const reservationsSymbol = Symbol.for("pi.idle-wake.v1");
 const wakeGlobal = globalThis as typeof globalThis & { [reservationsSymbol]?: WeakMap<object, WakeReservation> };
@@ -15,11 +21,12 @@ const reservations = wakeGlobal[reservationsSymbol] ?? (wakeGlobal[reservationsS
 
 export interface ParentWake {
 	/**
-	 * pi.sendMessage, except that a turn-triggering message to an idle parent is appended and the
-	 * turn is started with sendUserMessage. Pi starts a sendMessage-triggered run without
-	 * before_agent_start (earendil-works/pi#5581), so that run drops every hook-set prompt section.
-	 * Returns true when the message was appended that way: Pi emits no extension message_start for it.
+	 * pi.sendMessage that shares the idle-wake reservation. A turn-triggering message to an idle
+	 * parent starts the run itself: Pi runs before_agent_start for it and emits its message_start.
+	 * Returns true when the message was only appended (held, or another wake is already starting
+	 * the run): Pi emits no extension message_start for it.
 	 * After userAborted() and until the next run starts, a turn-triggering message is only appended.
+	 * So it is during a manual compaction, which Pi does not guard against a new run; takeDeferredWake() reports it.
 	 */
 	sendMessage(...args: Parameters<ExtensionAPI["sendMessage"]>): boolean;
 	/** True from an idle wake until its run starts or the session shuts down. Past the deadline it holds only while the parent is busy, which may still be the wake's preflight (for example compacting). */
@@ -28,17 +35,18 @@ export interface ParentWake {
 	agentStarted(): void;
 	/** The user stopped the parent run: hold wakes until the next run starts. */
 	userAborted(): void;
-	/** A deliberate resume (manual compaction) drops the hold without touching the shared wake reservation. */
-	releaseHold(): void;
 	isHeld(): boolean;
+	/** True once if a wake was only appended because a manual compaction was in progress. */
+	takeDeferredWake(): boolean;
 	sessionShutdown(reason: string | undefined): void;
 }
 
-export function createParentWake(pi: Pick<ExtensionAPI, "sendMessage" | "sendUserMessage">, now: () => number = Date.now): ParentWake {
+export function createParentWake(pi: Pick<ExtensionAPI, "sendMessage">, now: () => number = Date.now): ParentWake {
 	let ctx!: Pick<ExtensionContext, "isIdle">;
 	// Captured at bind: Pi's ctx throws once stale, which it can be by session_shutdown.
 	let session: { manager: object; id: string } | undefined;
 	let held = false;
+	let deferred = false;
 	// Look the reservation up on every access: another extension may have created this session's entry.
 	const reservation = (): WakeReservation => {
 		// Pi can shut an extension down before session_start binds it; an unbound wake reserved nothing.
@@ -59,36 +67,38 @@ export function createParentWake(pi: Pick<ExtensionAPI, "sendMessage" | "sendUse
 				pi.sendMessage(message, options);
 				return false;
 			}
-			if (held) {
+			if (held || (ctx.isIdle() && reserved())) {
 				// Appended now, or at the end of a run still finishing; neither emits an extension message_start.
+				// A reserved wake's run picks the notice up when it starts.
 				pi.sendMessage(message, { triggerTurn: false });
 				return true;
 			}
-			if (!ctx.isIdle()) {
-				pi.sendMessage(message, options);
-				return false;
+			if (session && compactionInProgress(session.manager)) {
+				deferred = true;
+				pi.sendMessage(message, { triggerTurn: false });
+				return true;
 			}
-			pi.sendMessage(message, { triggerTurn: false });
-			if (!reserved()) {
-				reservation().sentAt = now();
-				// Steer queues the wake if another prompt starts the run first.
-				pi.sendUserMessage(PARENT_WAKE_TEXT, { deliverAs: "steer" });
-			}
-			return true;
+			if (ctx.isIdle()) reservation().sentAt = now();
+			pi.sendMessage(message, options);
+			return false;
 		},
 		isPending: () => reservation().sentAt !== undefined && (reserved() || !ctx.isIdle()),
 		bindSession(context) {
 			ctx = context;
 			session = { manager: context.sessionManager, id: context.sessionManager.getSessionId() };
-			held = false;
+			held = deferred = false;
 		},
 		agentStarted() {
 			reservation().sentAt = undefined;
-			held = false;
+			held = deferred = false;
 		},
 		userAborted: () => { held = true; },
-		releaseHold: () => { held = false; },
 		isHeld: () => held,
+		takeDeferredWake() {
+			const wasDeferred = deferred;
+			deferred = false;
+			return wasDeferred;
+		},
 		sessionShutdown(reason) {
 			if (reason !== "reload") reservation().sentAt = undefined;
 		},

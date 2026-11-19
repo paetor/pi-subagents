@@ -1,9 +1,9 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { snapshotBackgroundWork } from "../../api/background-work.ts";
 import type { Details, SubagentState } from "../../shared/types.ts";
 import { listAsyncRuns } from "./async-status.ts";
 import type { ReadonlyDrainObservation } from "../shared/readonly-drain-observation.ts";
-import { waitForSubagents, waitRunScopes, type SubagentWaitDeps, type SubagentWaitParams, type WaitEventBus } from "./subagent-wait.ts";
+import { backgroundWorkForSession, waitForSubagents, waitRunScopes, type SubagentWaitDeps, type SubagentWaitParams, type WaitEventBus } from "./subagent-wait.ts";
+import { waitToolName } from "../../shared/wait-tool-name.ts";
 
 export const DEFAULT_AUTO_DRAIN_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -36,7 +36,7 @@ function hasOutstandingWork(deps: AutoDrainDeps, sessionId: string, nowMs: numbe
 	const detachedForeground = [...(deps.state.foregroundRuns?.values() ?? [])].some((run) =>
 		run.sessionId === sessionId && run.children.some((child) => child.status === "detached")
 	);
-	return asyncRuns.length > 0 || snapshotBackgroundWork(sessionId, nowMs).items.length > 0 || detachedForeground;
+	return asyncRuns.length > 0 || backgroundWorkForSession(deps, nowMs).items.length > 0 || detachedForeground;
 }
 
 /** Drain all work owned by the current headless session, including work added while draining. */
@@ -79,7 +79,7 @@ export async function drainOutstandingWork(deps: AutoDrainDeps, observation?: Re
 				},
 			);
 			if (waitResult.isError) {
-				throw new Error(`Auto-drain failed for session '${sessionId}': ${resultText(waitResult) || "bg_wait returned an error without details"}.`);
+				throw new Error(`Auto-drain failed for session '${sessionId}': ${resultText(waitResult) || `${waitToolName()} returned an error without details`}.`);
 			}
 			if (waitResult.details.wait?.reason === "supervisor_request") break;
 			if (deps.hasPendingSupervisorRequest?.()) break;

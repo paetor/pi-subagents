@@ -36,11 +36,14 @@ export interface McpServerDefinition {
 	/** Per-server override of the global `settings.toolPrefix`, matching the adapter. */
 	toolPrefix?: McpToolPrefix;
 	protocolVersion?: string;
-	directTools?: boolean | string[];
+	/** Validated so adapter configs load; `mcp:` selectors do not read it. */
+	directTools?: boolean | string[] | "search";
 	httpTransport?: string;
 	pluginDataDir?: string;
 	literalEnv?: boolean;
 	inheritEnv?: boolean;
+	/** Only literal true disables a server, matching pi-mcp-adapter. */
+	disabled?: boolean;
 }
 
 export function isMcpServerDefinition(value: unknown): value is McpServerDefinition {
@@ -59,7 +62,7 @@ export function isMcpServerDefinition(value: unknown): value is McpServerDefinit
 	}
 	if (value.requestHeadersCommand !== undefined && !isRequestHeadersCommand(value.requestHeadersCommand)) return false;
 	if (value.auth !== undefined && value.auth !== "oauth" && value.auth !== "bearer" && value.auth !== false) return false;
-	return value.directTools === undefined || typeof value.directTools === "boolean" || isStringArray(value.directTools);
+	return value.directTools === undefined || typeof value.directTools === "boolean" || value.directTools === "search" || isStringArray(value.directTools);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -14,7 +14,7 @@ import { validateDisabledFeatures } from "../shared/disabled-features.ts";
 
 // Explicit route identity, worktree, checkpoint, and tool-surface policies must not be silently
 // discarded and replaced by the built-in defaults after validation fails.
-const FAIL_CLOSED_CONFIG_KEYS = ["worktreeProvider", "worktreeBranchPrefix", "modelResponseAliases", "modelExclusions", "checkpointBeforeDeadlineMs", "disabledFeatures", "scheduledRuns", "toolActivation", "authorityPolicy", "permissions", "toolBudget", "runnerLaunchers"];
+const FAIL_CLOSED_CONFIG_KEYS = ["worktreeProvider", "worktreeBranchPrefix", "modelResponseAliases", "modelExclusions", "checkpointBeforeDeadlineMs", "disabledFeatures", "scheduledRuns", "toolActivation", "authorityPolicy", "permissions", "toolBudget", "runnerLaunchers", "globalConcurrencyLimit"];
 
 const ARTIFACT_DIR_PREFERENCES = new Set<ArtifactDirPreference>(["project", "session", "temp"]);
 const FLEET_KEYBINDING_ACTION_SET = new Set<string>(FLEET_KEYBINDING_ACTIONS);
@@ -181,6 +181,12 @@ function validateConfig(config: Record<string, unknown>): void {
 			|| config.maxActiveAsyncRunsPerSession < 0)) {
 		throw new Error("config.maxActiveAsyncRunsPerSession must be a non-negative integer");
 	}
+	if (config.globalConcurrencyLimit !== undefined
+		&& (typeof config.globalConcurrencyLimit !== "number"
+			|| !Number.isInteger(config.globalConcurrencyLimit)
+			|| config.globalConcurrencyLimit < 1)) {
+		throw new Error("config.globalConcurrencyLimit must be a positive integer");
+	}
 	if (config.resultScanLogging !== undefined && config.resultScanLogging !== "all" && config.resultScanLogging !== "activity" && config.resultScanLogging !== "off") {
 		throw new Error('config.resultScanLogging must be "all", "activity", or "off"');
 	}
@@ -199,6 +205,12 @@ function validateConfig(config: Record<string, unknown>): void {
 	if (config.pinToolDeclarations !== undefined && typeof config.pinToolDeclarations !== "boolean") {
 		throw new Error("config.pinToolDeclarations must be a boolean");
 	}
+	if (config.enableSlashCommands !== undefined && typeof config.enableSlashCommands !== "boolean") {
+		throw new Error("config.enableSlashCommands must be a boolean");
+	}
+	if (config.autoResume !== undefined && typeof config.autoResume !== "boolean") {
+		throw new Error("config.autoResume must be a boolean");
+	}
 	if (config.toolActivation !== undefined && config.toolActivation !== "auto" && config.toolActivation !== "dynamic" && config.toolActivation !== "eager") {
 		throw new Error('config.toolActivation must be "auto", "dynamic", or "eager"');
 	}
@@ -215,6 +227,12 @@ function validateConfig(config: Record<string, unknown>): void {
 	validateMainWindowRendererConfig(config.mainWindowRenderer);
 	validateOrcaProgressTabsConfig(config.orcaProgressTabs);
 	validateRunnerLaunchersConfig(config.runnerLaunchers);
+}
+
+// An invalid value counts as unset; above Node's timer ceiling a timer fires almost at once.
+export function resolveConfigDefaultTimeoutMs(raw: unknown): number | undefined {
+	if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > 2_147_483_647) return undefined;
+	return raw;
 }
 
 export function getConfigPath(): string {

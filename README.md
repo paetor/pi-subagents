@@ -14,7 +14,7 @@
 pi install npm:pi-subagents
 ```
 
-That is the only required step. Background children use the host's SDK: npm Pi keeps its detached Node runner; the official Pi 0.86.1 Linux x64 standalone release loads the same runner through Pi's embedded SDK, without a separate SDK install. See [Standalone background execution](docs/standalone-background.md) for the supported boundary and validation gate.
+That is the only required step. pi-subagents needs Pi 1.2.0 or newer. Background children use the host's SDK: npm Pi keeps its detached Node runner; the official Pi 1.2.0 Linux x64 standalone release loads the same runner through Pi's embedded SDK, without a separate SDK install. See [Standalone background execution](docs/standalone-background.md) for the supported boundary and validation gate.
 
 ## Try this first
 
@@ -62,7 +62,7 @@ The extension ships with agents you can use immediately:
 | `researcher` | Web/docs research with sources and a concise research brief. Requires [pi-web-access in the child](docs/agents.md#web-research-prerequisites). |
 | `evidence-auditor` | Independently checks whether important research claims are supported by their sources. Requires [pi-web-access in the child](docs/agents.md#web-research-prerequisites). |
 | `worker` | Implementation work. Edits files, validates, escalates unapproved decisions instead of guessing. |
-| `reviewer` | Code review and small fixes against the task/plan, tests, edge cases, and simplicity. |
+| `reviewer` | Read-only code review against the task/plan, tests, edge cases, and simplicity. |
 | `oracle` | A second opinion before acting. Challenges assumptions without editing. |
 | `delegate` | A lightweight general delegate that behaves close to the parent session. |
 

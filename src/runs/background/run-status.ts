@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { safeTerminalText } from "../../shared/display-text.ts";
 import { getArtifactPaths, getArtifactsDir } from "../../shared/artifacts.ts";
-import { readFleetTranscript } from "../../tui/fleet-transcript.ts";
+import { readFleetTranscript } from "../../shared/fleet-transcript-reader.ts";
 import { formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLabel, formatWorkflowStageLine, listAsyncRuns } from "./async-status.ts";
 import { formatAsyncResultTranscript, formatAsyncRunTranscript, formatNestedRunTranscript, inspectSubagentFleet } from "./fleet-view.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
@@ -36,7 +36,10 @@ import { validHostStepNodes } from "../shared/host-step-status.ts";
 import { workflowAsyncChildSteeringGuidance } from "../shared/workflow-async-child-guidance.ts";
 import { formatWorkflowKeyRevival, projectWorkflowKeyRevival } from "../../workflows/workflow-revival.ts";
 import { capSummaryOutputs } from "../shared/single-output.ts";
+import { formatParallelHandoffLines } from "../shared/kept-branch-text.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
+import { foregroundChildStateLabel } from "../foreground/foreground-history.ts";
+import { waitToolName } from "../../shared/wait-tool-name.ts";
 
 /** A step whose structured output has a path line needs only a short inline preview. */
 const STRUCTURED_PREVIEW_WITH_PATH_CHARS = 500;
@@ -143,7 +146,7 @@ function formatResumeGuidance(runId: string | undefined, children: Array<{ agent
 	const resumableWorkflowChildren = workflowChildren.filter(({ child }) => !(child.status === "paused" && child.activityState === "needs_attention"));
 	if (workflowChildren.length > 0) {
 		return [
-			...supervisorDetachedWorkflowChildren.map(({ child }) => `Recovery workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: reply to the supervisor request first, then wait with bg_wait({ id: "${child.runId}" }). Use subagent({ action: "status", id: "${child.runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.`),
+			...supervisorDetachedWorkflowChildren.map(({ child }) => `Recovery workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: reply to the supervisor request first, then wait with ${waitToolName()}({ id: "${child.runId}" }). Use subagent({ action: "status", id: "${child.runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.`),
 			...resumableWorkflowChildren.map(({ child }) => `Revive workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: subagent({ action: "resume", id: "${child.runId}", message: "..." })`),
 		].join("\n");
 	}
@@ -222,7 +225,7 @@ function formatRememberedForegroundStatus(run: ForegroundResumeRun): string {
 	for (const child of run.children) {
 		const output = rememberedForegroundChildOutput(child).trim().split(/\r?\n/).find((line) => line.trim());
 		const parts = [
-			`${child.index + 1}. ${child.sessionName?.trim() || child.agent} ${child.status}`,
+			`${child.index + 1}. ${child.sessionName?.trim() || child.agent} ${foregroundChildStateLabel(run, child)}`,
 			child.exitCode !== undefined ? `exit ${child.exitCode}` : undefined,
 			child.detachedReason ? `detached: ${child.detachedReason}` : undefined,
 			child.acceptance ? `acceptance: ${child.acceptance.status}` : undefined,
@@ -243,7 +246,7 @@ function formatRememberedForegroundStatus(run: ForegroundResumeRun): string {
 	const detached = run.children.some((child) => child.status === "detached");
 	const resumable = run.children.find((child) => hasExistingSessionFile(child.sessionFile));
 	if (detached) {
-		lines.push(`Recovery: reply to the supervisor request first, then wait with bg_wait({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
+		lines.push(`Recovery: reply to the supervisor request first, then wait with ${waitToolName()}({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
 	} else if (resumable) {
 		lines.push(run.children.length === 1
 			? `Revive: subagent({ action: "resume", id: "${run.runId}", message: "..." })`
@@ -622,7 +625,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				status.turnBudget ? `Turn budget: ${status.turnBudget.turnCount}/${status.turnBudget.maxTurns}+${status.turnBudget.graceTurns} (${status.turnBudget.outcome})` : undefined,
 				`Dir: ${asyncDir}`,
 				outputPath ? `Output: ${outputPath}` : undefined,
-				status.parallelHandoff ? `Parallel handoff: ${status.parallelHandoff.path}` : undefined,
+				...(status.parallelHandoff ? formatParallelHandoffLines(status.parallelHandoff.path, status.parallelHandoff.keptBranches) : []),
 				reconciliation.message ? `Diagnosis: ${reconciliation.message}` : undefined,
 				reconciliation.resultPath && fs.existsSync(reconciliation.resultPath) ? `Result: ${reconciliation.resultPath}` : undefined,
 			].filter((line): line is string => Boolean(line));
@@ -660,10 +663,11 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 						lines.push(`  Runner: external-cli (${runner.command}${runner.args.length ? ` ${runner.args.join(" ")}` : ""})`);
 						lines.push(`  Adapter: ${runner.adapter.id} v${runner.adapter.version} (${runner.adapter.executionMode})`);
 						if (runner.safety) {
-							if ("approvalPolicy" in runner.safety) lines.push(`  Safety: ${"access" in runner.safety ? `access=${runner.safety.access}, ` : ""}sandbox=${runner.safety.sandbox}, approval=${runner.safety.approvalPolicy}, ephemeral=${runner.safety.ephemeral}`);
-							else if ("mode" in runner.safety) lines.push(`  Safety: access=${runner.safety.access}, auth=${runner.safety.authentication}, mode=${runner.safety.mode}, sandbox=${runner.safety.sandbox}, workspaceTrust=${runner.safety.workspaceTrust}, sessionReuse=${runner.safety.sessionReuse}`);
-							else if ("authentication" in runner.safety) lines.push(`  Safety: access=${runner.safety.access}, auth=${runner.safety.authentication}, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, settingsTrust=${runner.safety.userSettingsTrust}, persistence=${runner.safety.sessionPersistence}`);
-							else lines.push(`  Safety: access=read-only, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, persistence=${runner.safety.sessionPersistence}`);
+							const safetyLabel = "  Safety (adapter profile, not measured):";
+							if ("approvalPolicy" in runner.safety) lines.push(`${safetyLabel} ${"access" in runner.safety ? `access=${runner.safety.access}, ` : ""}sandbox=${runner.safety.sandbox}, approval=${runner.safety.approvalPolicy}, ephemeral=${runner.safety.ephemeral}`);
+							else if ("mode" in runner.safety) lines.push(`${safetyLabel} access=${runner.safety.access}, auth=${runner.safety.authentication}, mode=${runner.safety.mode}, sandbox=${runner.safety.sandbox}, workspaceTrust=${runner.safety.workspaceTrust}, sessionReuse=${runner.safety.sessionReuse}`);
+							else if ("authentication" in runner.safety) lines.push(`${safetyLabel} access=${runner.safety.access}, auth=${runner.safety.authentication}, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, settingsTrust=${runner.safety.userSettingsTrust}, persistence=${runner.safety.sessionPersistence}`);
+							else lines.push(`${safetyLabel} access=read-only, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, persistence=${runner.safety.sessionPersistence}`);
 						}
 						lines.push(`  Capabilities: stop=${runner.capabilities.stop}, steer=false, resume=false, structuredOutput=false, toolEvents=false, supervisor=unsupported, forkContext=false, extensionBindings=false`);
 						lines.push(`  Unsupported steer: ${runner.unsupportedReasons.steer}`);
@@ -743,7 +747,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 		}
 		try {
 			const raw = fs.readFileSync(resultPath, "utf-8");
-			const data = JSON.parse(raw) as { id?: string; runId?: string; sessionId?: string; toolCallId?: string; agent?: string; success?: boolean; summary?: string; output?: string; exitCode?: number; state?: string; stopped?: boolean; timedOut?: boolean; turnBudgetExceeded?: boolean; processSignal?: string | null; sessionFile?: string; timeoutRecovery?: unknown; parallelHandoff?: { path?: string }; results?: Array<{ agent?: string; sessionName?: string; runId?: string; workflowKey?: string; output?: string; summary?: string; sessionFile?: string; state?: string; success?: boolean; exitCode?: number | null; stopped?: boolean; timedOut?: boolean; turnBudgetExceeded?: boolean; interrupted?: boolean; processSignal?: string | null; timeoutRecovery?: unknown; savedOutputPath?: string; artifactPaths?: { outputPath?: string } }> };
+			const data = JSON.parse(raw) as { id?: string; runId?: string; sessionId?: string; toolCallId?: string; agent?: string; success?: boolean; summary?: string; output?: string; exitCode?: number; state?: string; stopped?: boolean; timedOut?: boolean; turnBudgetExceeded?: boolean; processSignal?: string | null; sessionFile?: string; timeoutRecovery?: unknown; parallelHandoff?: { path?: string; keptBranches?: unknown }; results?: Array<{ agent?: string; sessionName?: string; runId?: string; workflowKey?: string; output?: string; summary?: string; sessionFile?: string; state?: string; success?: boolean; exitCode?: number | null; stopped?: boolean; timedOut?: boolean; turnBudgetExceeded?: boolean; interrupted?: boolean; processSignal?: string | null; timeoutRecovery?: unknown; savedOutputPath?: string; artifactPaths?: { outputPath?: string } }> };
 			if (params.view === "transcript") {
 				try {
 					return { content: [{ type: "text", text: formatAsyncResultTranscript(data, resultPath, { index: params.index, lines: params.lines }) }], details: { mode: "single", results: [] } };
@@ -769,7 +773,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				: data.success ? "complete" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
 			const runId = data.runId ?? data.id ?? resolvedId;
 			const lines = [`Run: ${runId}`, data.toolCallId ? `Tool call: ${data.toolCallId}` : undefined, `State: ${status}`, `Result: ${resultPath}`].filter((line): line is string => Boolean(line));
-			if (data.parallelHandoff?.path) lines.push(`Parallel handoff: ${data.parallelHandoff.path}`);
+			if (data.parallelHandoff?.path) lines.push(...formatParallelHandoffLines(data.parallelHandoff.path, data.parallelHandoff.keptBranches));
 			const receipt = (data as Record<string, unknown>).workflowReceipt;
 			const receiptPath = receipt && typeof receipt === "object" && !Array.isArray(receipt)
 				? (receipt as Record<string, unknown>).path : undefined;

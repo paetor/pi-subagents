@@ -19,6 +19,7 @@ import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { contextModeLabel, summarizeContextModes } from "../shared/context-mode.ts";
 import { formatAsyncRunOutputPath, formatAsyncRunProgressLabel, listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
 import { isTrustedRecordedSessionFile } from "../../shared/session-file-trust.ts";
+import { waitToolName } from "../../shared/wait-tool-name.ts";
 
 const DEFAULT_TRANSCRIPT_LINES = 80;
 const MAX_TRANSCRIPT_LINES = 500;
@@ -198,14 +199,14 @@ function sessionMessageParts(record: unknown): SessionTranscriptMessage[] {
 	const parts: SessionTranscriptMessage[] = [];
 	for (const part of content) {
 		if (!part || typeof part !== "object") continue;
-		const entry = part as { type?: unknown; text?: unknown; name?: unknown; toolName?: unknown; args?: unknown; result?: unknown; content?: unknown; isError?: unknown };
+		const entry = part as { type?: unknown; text?: unknown; name?: unknown; toolName?: unknown; arguments?: unknown; result?: unknown; content?: unknown; isError?: unknown };
 		if (typeof entry.text === "string") {
 			if (entry.text.trim()) parts.push({ role, kind: "text", text: entry.text });
 			continue;
 		}
 		if (entry.type === "toolCall" || entry.type === "tool_call") {
 			const name = typeof entry.name === "string" ? entry.name : typeof entry.toolName === "string" ? entry.toolName : "tool";
-			parts.push({ role, kind: "toolCall", name, text: `[tool: ${name}${entry.args === undefined ? "" : ` ${stringifyJsonPreview(entry.args)}`}]` });
+			parts.push({ role, kind: "toolCall", name, text: `[tool: ${name}${entry.arguments === undefined ? "" : ` ${stringifyJsonPreview(entry.arguments)}`}]` });
 			continue;
 		}
 		if (entry.type === "toolResult" || entry.type === "tool_result") {
@@ -334,7 +335,7 @@ function formatDetachedForegroundFleetLines(runs: ForegroundRun[]): string[] {
 		const childSummary = detachedChildren.map((child) => `${fleetChildDisplayName(child)} #${child.index}`).join(", ");
 		lines.push(`- ${run.runId} | detached | ${run.mode}${childSummary ? ` | ${childSummary}` : ""}`);
 		lines.push(`  status: subagent({ action: "status", id: "${run.runId}" })`);
-		lines.push(`  recovery: reply to the supervisor request first, then wait with bg_wait({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
+		lines.push(`  recovery: reply to the supervisor request first, then wait with ${waitToolName()}({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
 	}
 	return lines;
 }
@@ -490,8 +491,6 @@ function appendKnownArtifacts(lines: string[], input: { outputPaths: string[]; s
 }
 
 /**
- * Sanitizes each assembled line independently.
- *
  * Sanitizing the joined response would let a single binary fragment in child
  * output collapse the whole transcript, including run state, artifact paths, and
  * warnings, into the binary placeholder. Per-line sanitization keeps that damage

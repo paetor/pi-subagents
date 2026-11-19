@@ -1,12 +1,3 @@
-/**
- * Integration tests for async (background) agent execution.
- *
- * Tests the async support utilities: jiti availability check,
- * status file reading/caching.
- *
- * Requires pi packages to be importable. Skips gracefully if unavailable.
- */
-
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -15,6 +6,7 @@ import { ChildProcess } from "node:child_process";
 import { channel } from "node:diagnostics_channel";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { childSessionFactoryModule, setChildSessionFactoryModule } from "../../src/runs/shared/child-session.ts";
+import { recoveryDescriptorPath } from "../../src/runs/shared/run-launch-folder.ts";
 import { createEventBus, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir } from "../support/helpers.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
@@ -24,7 +16,7 @@ import { createRunFanoutBudget, getRunFanoutBudgetSnapshot, writeRunFanoutBudget
 import { writeRetainedRequiredChildExtensions } from "../../src/shared/required-child-extensions.ts";
 import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { deriveForkPromptCacheKey } from "../../src/runs/shared/child-tool-plan.ts";
-import { INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
+import { INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR, STRUCTURED_OUTPUT_FOLLOW_UP, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
 import type { ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
 import type { AsyncExecutionResult, AsyncResultPayload, AsyncStatusPayload } from "../support/async-execution-fixture.ts";
 import {
@@ -835,6 +827,69 @@ export default function() {
 		assert.match(status.steps?.[0]?.error ?? "", /Structured output validation failed: ok: is required/);
 	});
 
+	it("background keeps a valid structured_output when the reply after it hit the length limit", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			jsonl: [
+				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
+				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+				{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Here is a summary of" }], model: "mock/test-model", stopReason: "length", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
+			],
+			structuredOutputCapture: { ok: true },
+		});
+		const id = `async-single-schema-length-${Date.now().toString(36)}`;
+
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Return structured data",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			acceptance: false,
+			structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true, payload.results[0]?.error);
+		assert.deepEqual(payload.results[0]?.structuredOutput, { ok: true });
+	});
+
+	it("background execution gives a structured child one follow-up turn to call structured_output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const prompts = () => fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.map((name) => (JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { args: string[] }).args.at(-1));
+		const runStructured = async (id: string) => {
+			executeAsyncSingle(id, {
+				agent: "worker", task: "Return structured data", agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+				acceptance: false, structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+			});
+			return JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		};
+		mockPi.onCall({ output: "prose without the tool call" });
+		mockPi.onCall({ matchArgIncludes: STRUCTURED_OUTPUT_FOLLOW_UP, structuredOutput: { ok: true } });
+
+		const recovered = await runStructured(`async-single-schema-follow-up-${Date.now().toString(36)}`);
+
+		assert.equal(recovered.success, true, recovered.results[0]?.error);
+		assert.deepEqual(recovered.results[0]?.structuredOutput, { ok: true });
+		assert.equal(prompts().filter((prompt) => prompt === STRUCTURED_OUTPUT_FOLLOW_UP).length, 1);
+
+		mockPi.reset();
+		mockPi.onCall({ output: "prose without the tool call" });
+		const missing = await runStructured(`async-single-schema-follow-up-missing-${Date.now().toString(36)}`);
+
+		assert.equal(missing.success, false);
+		assert.match(missing.results[0]?.error ?? "", /Missing structured_output call/);
+		assert.equal(missing.results[0]?.usage?.turns, 2);
+		assert.equal(prompts().filter((prompt) => prompt === STRUCTURED_OUTPUT_FOLLOW_UP).length, 1);
+		assert.equal(prompts().length, 2);
+	});
+
 	it("does not persist malformed outputSchema compiler text in background evidence", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const sentinel = "BACKGROUND_PRIVATE_SCHEMA_SENTINEL";
 		const structuredOutputSchema = { type: "string", pattern: `${sentinel}_[invalid` };
@@ -916,7 +971,8 @@ export default function() {
 		assert.equal(children.find(({ key }) => key === "inherited")?.ok, false);
 		assert.match(children.find(({ key }) => key === "inherited")?.error ?? "", /Missing structured_output call/);
 		assert.deepEqual(children.find(({ key }) => key === "disabled"), { key: "disabled", ok: true, output: "false opted out" });
-		assert.equal(mockPi.callCount(), 3);
+		// Each inherited-schema child that skips structured_output also gets one follow-up prompt.
+		assert.equal(mockPi.callCount(), 5);
 	});
 
 	it("background outputSchema runs fail closed when required acceptanceReport is missing", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1447,7 +1503,7 @@ export default function() {
 				denyExtensions: false,
 				sources: ["agent:planner", "current-caller", "original-parent"],
 			});
-			const descriptor = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, retainedId, "recovery-descriptor.json"), "utf-8"));
+			const descriptor = JSON.parse(fs.readFileSync(recoveryDescriptorPath(ASYNC_DIR, retainedId), "utf-8"));
 			assert.deepEqual(descriptor.allowedAgents, ["researcher"]);
 			assert.deepEqual(descriptor.capabilityCeiling, {
 				version: 1,
@@ -1757,7 +1813,7 @@ syncBuiltinESMExports();
 			maxSubagentDepth: 2,
 		});
 		await readAsyncPayload(sourceId);
-		assert.equal(JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, sourceId, "recovery-descriptor.json"), "utf-8")).fast, true);
+		assert.equal(JSON.parse(fs.readFileSync(recoveryDescriptorPath(ASYNC_DIR, sourceId), "utf-8")).fast, true);
 
 		mockPi.onCall({ output: "Revived async work" });
 		const result = await makeAsyncExecutor([makeAgent("worker")]).execute(
@@ -1853,7 +1909,7 @@ syncBuiltinESMExports();
 			maxSubagentDepth: 2,
 		});
 		await readAsyncPayload(sourceId);
-		const descriptor = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, sourceId, "recovery-descriptor.json"), "utf-8"));
+		const descriptor = JSON.parse(fs.readFileSync(recoveryDescriptorPath(ASYNC_DIR, sourceId), "utf-8"));
 		assert.equal(descriptor.modelOverrideFromParent, true);
 		assert.equal(descriptor.modelOrigin, "inherited");
 

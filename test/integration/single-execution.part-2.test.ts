@@ -1,14 +1,3 @@
-/**
- * Integration tests for single (sync) agent execution.
- *
- * Uses the local createMockPi() helper to simulate the pi CLI.
- * Tests the full spawn→parse→result pipeline in runSync without a real LLM.
- *
- * These tests require pi packages to be importable (they run inside a pi
- * environment or with pi packages installed). If unavailable, tests skip
- * gracefully.
- */
-
 import { describe, it } from "node:test";
 import {
 	tempDir, mockPi, available, runSync, getFinalOutput,
@@ -39,7 +28,7 @@ import {
 import registerSubagentExtension from "../../src/extension/index.ts";
 import { handleSubagentControlNotice } from "../../src/extension/control-notices.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
-import { INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
+import { INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR, STRUCTURED_OUTPUT_FOLLOW_UP, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
 import {
 	SUBAGENT_DELEGATION_REQUEST_EVENT,
 	SUBAGENT_DELEGATION_RESPONSE_EVENT,
@@ -51,6 +40,8 @@ import {
 import { CHAIN_RUNS_DIR, DIRS, INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT, SUBAGENT_CONTROL_EVENT, TEMP_ARTIFACTS_DIR, type AsyncStatus, type ChildWatchdogProgress, type ControlEvent, type SubagentState } from "../../src/shared/types.ts";
 import { ACTIVE_RUN_INDEX_DIR } from "../../src/runs/background/active-run-index.ts";
 import { encodeIndexSegment } from "../../src/runs/background/index-segment.ts";
+import { currentBootId } from "../../src/runs/background/boot-id.ts";
+import { currentPidNamespaceScope } from "../../src/runs/background/pid-namespace.ts";
 import { waitForSubagents } from "../../src/runs/background/subagent-wait.ts";
 import { listAsyncRuns } from "../../src/runs/background/async-status.ts";
 import { formatControlNoticeMessage } from "../../src/runs/shared/subagent-control.ts";
@@ -73,6 +64,13 @@ import { toSubagentDelegationExecutionParams, toSubagentDelegationUpdate } from 
 import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
 import { ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
+
+/** Every saved foreground run: one file each under results/foreground-history. */
+function savedForegroundRuns<T>(): T[] {
+	const dir = path.join(DIRS.results, "foreground-history");
+	const names = fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith(".json")) : [];
+	return names.map((name) => JSON.parse(fs.readFileSync(path.join(dir, name), "utf-8")) as T);
+}
 
 describe("single sync execution", { skip: !available ? "pi packages not available" : undefined }, () => {
 	installSingleExecutionHooks();
@@ -930,8 +928,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 				const settleDeadline = Date.now() + 10_000;
 				while (!child?.settled && Date.now() < settleDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
 				await new Promise((resolve) => setTimeout(resolve, 200));
-				const history = JSON.parse(fs.readFileSync(path.join(DIRS.results, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string; children: Array<{ status: string; error?: string }> }> };
-				const recorded = history.runs.find((run) => run.runId === runId)?.children[0];
+				const recorded = savedForegroundRuns<{ runId: string; children: Array<{ status: string; error?: string }> }>().find((run) => run.runId === runId)?.children[0];
 				assert.equal(recorded?.status, "stopped");
 				assert.match(recorded?.error ?? "", /runtime that ran it was replaced/);
 				assert.doesNotMatch(JSON.stringify(child?.session?.messages ?? []), /finished after replacement/);
@@ -950,6 +947,68 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			}
 		});
 	}
+
+	it("saves a foreground single run as running while it runs, and its final result replaces the record", { timeout: 60_000, skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const nonce = `foreground-running-${Date.now()}`;
+		const release = path.join(tempDir, `${nonce}.release`);
+		mockPi.onCall({ matchArgIncludes: `Single ${nonce}`, waitForPath: release, output: "single done" });
+		mockPi.onCall({ matchArgIncludes: `Workflow child ${nonce}`, waitForPath: release, output: "child done" });
+		type HistoryRun = { runId: string; updatedAt: number; owner?: { pid: number; pidNamespaceScope?: string; bootId?: string }; parentWorkflowRunId?: string; children: Array<{ status: string; sessionFile?: string }> };
+		const historyRuns = () => savedForegroundRuns<HistoryRun>();
+		const waitForRecord = async (label: string, predicate: (run: HistoryRun) => boolean): Promise<HistoryRun> => {
+			for (const deadline = Date.now() + 15_000; Date.now() < deadline; await new Promise((resolve) => setTimeout(resolve, 20))) {
+				const run = historyRuns().find(predicate);
+				if (run) return run;
+			}
+			assert.fail(`timed out waiting for ${label}`);
+		};
+		const startedAt = Date.now();
+		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), new Map(), undefined, undefined, undefined, undefined, () => {});
+		const single = executor.execute(`${nonce}-single`, { agent: "echo", task: `Single ${nonce}`, async: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const workflow = await executor.execute(`${nonce}-workflow`, { async: true, mission: false, workflowScript: `return (await runs.run("child", { agent: "echo", task: "Workflow child ${nonce}" })).output;` }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const workflowRunId = workflow.details.asyncId;
+		assert.ok(workflowRunId, workflow.content[0]?.text);
+		try {
+			const running = await waitForRecord("the single run's running record", (run) => run.updatedAt >= startedAt && run.parentWorkflowRunId === undefined && run.children[0]?.status === "running");
+			assert.equal(running.owner?.pid, process.pid);
+			assert.equal(running.owner?.pidNamespaceScope, currentPidNamespaceScope());
+			assert.equal(running.owner?.bootId, currentBootId());
+			assert.match(running.children[0]?.sessionFile ?? "", /\.jsonl$/, "the record points at the child's transcript");
+			const workflowChild = await waitForRecord("the workflow child's running record", (run) => run.parentWorkflowRunId === workflowRunId);
+			assert.equal(workflowChild.children[0]?.status, "running");
+			assert.equal(workflowChild.owner?.pid, process.pid);
+
+			fs.writeFileSync(release, "go");
+			const result = await single;
+			assert.equal(result.isError, undefined, result.content[0]?.text);
+			const finished = historyRuns().find((run) => run.runId === running.runId);
+			assert.equal(finished?.children[0]?.status, "completed");
+			assert.equal(finished?.owner, undefined);
+			const childFinished = await waitForRecord("the workflow child's final record", (run) => run.runId === workflowChild.runId && run.children[0]?.status !== "running");
+			assert.equal(childFinished.children[0]?.status, "completed");
+			assert.equal(childFinished.owner, undefined);
+		} finally {
+			fs.writeFileSync(release, "go");
+			await single.catch(() => undefined);
+		}
+	});
+
+	it("replaces the running record of an attached foreground run that is aborted mid-run", { timeout: 60_000, skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const nonce = `foreground-running-abort-${Date.now()}`;
+		const startedAt = Date.now();
+		mockPi.onCall({ matchArgIncludes: `Abort ${nonce}`, hangUntilAbort: true });
+		const runningRecord = () => savedForegroundRuns<{ runId: string; updatedAt: number; children: Array<{ status: string }> }>().find((run) => run.updatedAt >= startedAt && run.children[0]?.status === "running");
+		const controller = new AbortController();
+		const executor = makeExecutor([makeAgent("echo")]);
+		const pending = executor.execute(`${nonce}-single`, { agent: "echo", task: `Abort ${nonce}`, async: false }, controller.signal, undefined, makeMinimalCtx(tempDir));
+		let running = runningRecord();
+		for (const deadline = Date.now() + 15_000; !running && Date.now() < deadline; running = runningRecord()) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(running, "the run saved a running record");
+		controller.abort();
+		await pending.catch(() => undefined);
+		const after = savedForegroundRuns<{ runId: string; children: Array<{ status: string }> }>().find((run) => run.runId === running.runId);
+		assert.notEqual(after?.children[0]?.status ?? "removed", "running", "an aborted run never stays running in history");
+	});
 
 	it("routes registered structured text delegation through the concurrent executor", async () => {
 		const literalJsonText = '{"looks":"json"}';
@@ -1754,6 +1813,31 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		if (child?.artifactPaths?.outputPath) assert.match(fs.readFileSync(child.artifactPaths.outputPath, "utf-8"), /"note": "captured"/);
 	});
 
+	it("keeps a valid structured_output when the reply after it hit the length limit", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({
+			stdoutRaw: [
+				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
+				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+				mockAssistantMessage("Here is a summary of", "length"),
+			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+			structuredOutputCapture: { ok: true },
+		});
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"single-schema-length",
+			{ agent: "echo", task: "Return structured data", outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, acceptance: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.results?.[0]?.exitCode, 0);
+		assert.deepEqual(result.details?.results?.[0]?.structuredOutput, { ok: true });
+	});
+
 	it("saves the structured result, not closing prose, to a bound output file", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const structuredOutput = { ok: true, note: "captured" };
 		mockPi.onCall({ output: "Enough; writing up.", structuredOutput });
@@ -2396,6 +2480,31 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(fs.existsSync(path.dirname(child.structuredOutputPath)), false);
 	});
 
+	it("gives a structured child one follow-up turn to call structured_output", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const prompts = () => fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.map((name) => (JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { args: string[] }).args.at(-1));
+		const executor = makeExecutor([makeAgent("echo")]);
+		const params = { agent: "echo", task: "Return structured data", outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, acceptance: false, artifacts: false } as const;
+		mockPi.onCall({ output: "prose without the tool call" });
+		mockPi.onCall({ matchArgIncludes: STRUCTURED_OUTPUT_FOLLOW_UP, structuredOutput: { ok: true } });
+
+		const recovered = await executor.execute("single-schema-follow-up", params, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+
+		assert.equal(recovered.isError, undefined, recovered.content[0]?.text);
+		assert.deepEqual(recovered.details.results[0]?.structuredOutput, { ok: true });
+		assert.equal(prompts().filter((prompt) => prompt === STRUCTURED_OUTPUT_FOLLOW_UP).length, 1);
+
+		mockPi.reset();
+		mockPi.onCall({ output: "prose without the tool call" });
+		const missing = await executor.execute("single-schema-follow-up-missing", params, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+
+		assert.equal(missing.isError, true);
+		assert.match(missing.details.results[0]?.error ?? "", /Missing structured_output call/);
+		assert.equal(missing.details.results[0]?.usage.turns, 2);
+		assert.equal(prompts().filter((prompt) => prompt === STRUCTURED_OUTPUT_FOLLOW_UP).length, 1);
+		assert.equal(prompts().length, 2);
+	});
+
 	it("reports rejected structured_output evidence and lets a later valid call win", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const rejectedEvents = [
 			{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "structured-rejected", name: "structured_output", arguments: { value: {} } }], model: "mock/test-model", stopReason: "toolUse", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
@@ -2988,15 +3097,31 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.ok(Date.now() - startedAt >= 1200, "foreground runner must not terminate during compaction retry");
 	});
 
-	it("treats agent_settled as a clean terminal watermark", async () => {
-		const nonTerminalMessage = events.assistantMessage("settled without a terminal assistant stop") as { message: { stopReason: string } };
-		nonTerminalMessage.message.stopReason = "length";
-		mockPi.onCall({ jsonl: [nonTerminalMessage, { type: "agent_settled" }], keepAliveAfterFinalMessageMs: 5000 });
-		const startedAt = Date.now();
-		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Wait until settled", { acceptance: false });
+	it("finishes a child whose last event is a terminal agent_end", { timeout: 10_000 }, async () => {
+		mockPi.onCall({ jsonl: [events.assistantMessage("final reply"), { type: "agent_end", willRetry: false }], omitImplicitFinalEvents: true, hangUntilAbort: true });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Finish", { acceptance: false });
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.error, undefined);
-		assert.equal(getFinalOutput(result.messages), "settled without a terminal assistant stop");
+		assert.equal(getFinalOutput(result.messages), "final reply");
+	});
+
+	it("lets a compaction that runs after the final agent_end finish", { timeout: 10_000 }, async () => {
+		mockPi.onCall({ omitImplicitFinalEvents: true, steps: [
+			{ jsonl: [events.assistantMessage("final reply"), { type: "agent_end", willRetry: false }, { type: "compaction_start" }] },
+			{ delay: 1500, jsonl: [{ type: "compaction_end", willRetry: false }, { type: "agent_settled" }] },
+		] });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Finish", { acceptance: false });
+		assert.equal(result.exitCode, 0);
+		assert.equal(mockPi.sessions.at(-1)?.aborted, false, "the child is not aborted during its compaction");
+	});
+
+	it("fails a settled child whose final assistant response hit the length limit", async () => {
+		mockPi.onCall({ jsonl: [mockAssistantMessage("partial truncated response", "length"), { type: "agent_settled" }], keepAliveAfterFinalMessageMs: 5000 });
+		const startedAt = Date.now();
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Wait until settled", { acceptance: false });
+		assert.equal(getFinalOutput(result.messages), "partial truncated response");
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.error, "Response was truncated: the model reached its maximum output length.");
 		assert.ok(Date.now() - startedAt < 4000, "agent_settled should trigger bounded child cleanup");
 	});
 
@@ -3318,6 +3443,35 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			assert.equal(args[args.indexOf("--session") + 1], sessionFile);
 		}
 		assert.match(readAllCallArgs(true)[1]?.at(-1) ?? "", /Continue from the current files and transcript/);
+	});
+
+	it("gives a compaction-abort recovery the run budget left after the first attempt's supervisor wait", async () => {
+		const sessionFile = path.join(tempDir, "abort-recovery-supervisor-wait.jsonl");
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [{ ...events.toolStart("contact_supervisor", { reason: "need_decision", message: "Question" }), toolCallId: "ask-1" }] },
+				{ delay: 2_000, jsonl: [
+					{ ...events.toolEnd("contact_supervisor"), toolCallId: "ask-1" },
+					events.toolStart("write", { path: "side-effect.txt", content: "done" }),
+					events.toolEnd("write"),
+					events.toolResult("write", "Wrote side-effect.txt"),
+					{ type: "message_end", message: { role: "assistant", content: [], model: "openai/gpt-5-mini", stopReason: "error", errorMessage: "This operation was aborted", usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
+					{ type: "agent_settled" },
+					{ type: "compaction_start" },
+				] },
+			],
+			omitImplicitFinalEvents: true,
+			writeFiles: [{ path: "side-effect.txt", content: "done" }, { path: sessionFile, content: "{}\n" }],
+			keepAliveAfterFinalMessageMs: 5_000,
+			exitCode: 0,
+		});
+		mockPi.onCall({ delay: 50, output: "Recovered from retained session" });
+
+		const result = await runSync(tempDir, [makeAgent("echo", { model: "openai/gpt-5-mini" })], "echo", "Task", { runId: "abort-recovery-supervisor-wait", sessionFile, timeoutMs: 1_500 });
+
+		assert.equal(result.error, undefined);
+		assert.equal(result.finalOutput, "Recovered from retained session");
+		assert.equal(mockPi.callCount(), 2);
 	});
 
 	it("does not recover a compaction abort without a retained session", async () => {
@@ -4853,6 +5007,24 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.ok(elapsed < 5000, `should abort early, took ${elapsed}ms`);
 		// Exit code is platform-dependent (Windows: often 1 or 0, Linux: null/143)
 	});
+
+	for (const reason of ["need_decision", "progress_update"] as const) {
+		it(`foreground timeoutMs ${reason === "need_decision" ? "pauses while a child waits on" : "keeps running through"} contact_supervisor ${reason}`, async () => {
+			mockPi.onCall({ steps: [
+				{ delay: 40, jsonl: [{ ...events.toolStart("contact_supervisor", { reason, message: "Question" }), toolCallId: "ask-1" }] },
+				{ delay: 400, jsonl: [{ ...events.toolEnd("contact_supervisor"), toolCallId: "ask-1" }] },
+				{ delay: 40, jsonl: [events.assistantMessage("Done")] },
+			] });
+			const result = await runSync(tempDir, makeAgentConfigs(["worker"]), "worker", "Task", { timeoutMs: 250, acceptance: false });
+			if (reason === "need_decision") {
+				assert.equal(result.exitCode, 0, result.error);
+				assert.notEqual(result.timedOut, true);
+			} else {
+				assert.equal(result.timedOut, true);
+				assert.equal(result.error, "Subagent timed out after 250ms.");
+			}
+		});
+	}
 
 	it("marks foreground runs that exceed timeoutMs as timed out", async () => {
 		mockPi.onCall({ delay: 10000 });

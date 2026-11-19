@@ -25,6 +25,7 @@ assert.equal(os.homedir(), homeDir, "test isolation must redirect the home direc
 
 const { computeMcpServerHash, resolveMcpDirectToolResolution } = await import("../../src/runs/shared/mcp-direct-tool-allowlist.ts");
 const { getAgentDir, getProjectConfigDir } = await import("../../src/shared/utils.ts");
+const { resolvePiLaunchToolPlan } = await import("../../src/runs/shared/child-tool-plan.ts");
 
 const SELECTORS = ["codegraph/codegraph_explore", "codegraph/codegraph_node", "codegraph/codegraph_status"];
 const SELECTED_NAMES = ["codegraph_explore", "codegraph_node", "codegraph_status"];
@@ -73,20 +74,82 @@ describe("MCP direct-tool resolution config sources", () => {
 		}
 	});
 
-	it("resolves direct tools declared in the Pi-global mcp-adapter.json", () => {
-		writeServerConfig(path.join(agentDir, "mcp-adapter.json"), CURRENT_DEFINITION);
-		writeMetadataCache(CURRENT_DEFINITION);
-
-		const resolution = resolveMcpDirectToolResolution(SELECTORS, projectDir);
-
-		assert.deepEqual(resolution.selections.map((selection) => selection.name), SELECTED_NAMES);
-		assert.deepEqual(resolution.unresolvedSelectors, []);
+	it("resolves direct tools declared in the Pi-global mcp-adapter.json, including a server whose directTools is \"search\"", () => {
+		for (const definition of [CURRENT_DEFINITION, { ...CURRENT_DEFINITION, directTools: "search" } as McpServerDefinition]) {
+			writeServerConfig(path.join(agentDir, "mcp-adapter.json"), definition);
+			writeMetadataCache(definition);
+			const resolution = resolveMcpDirectToolResolution(SELECTORS, projectDir);
+			assert.deepEqual(resolution.selections.map((selection) => selection.name), SELECTED_NAMES);
+			assert.deepEqual(resolution.unresolvedSelectors, []);
+		}
 	});
 
 	it("computes config hashes identical to pi-mcp-adapter 3.1.0 for stdio servers", () => {
 		// Values reproduced from pi-mcp-adapter 3.1.0's real cache; drift breaks stdio direct-tool resolution.
 		assert.equal(computeMcpServerHash(CURRENT_DEFINITION), "d2b80559f0b1c85ccc625a4c7f875f64e0defc60648f56d2a51cbe5dfa3d967e");
 		assert.equal(computeMcpServerHash({ ...CURRENT_DEFINITION, inheritEnv: false }), "345b359732aa3ece7fdf8b98b9927809243685846c2b375e98a312a80e89e333");
+	});
+
+	it("expands ${NAME:-default} like pi-mcp-adapter when hashing", () => {
+		// Values computed by pi-mcp-adapter's computeServerHash with the same environment.
+		const names = ["PI_SUBAGENTS_TEST_SET", "PI_SUBAGENTS_TEST_EMPTY", "PI_SUBAGENTS_TEST_UNSET"] as const;
+		process.env.PI_SUBAGENTS_TEST_SET = "set-value";
+		process.env.PI_SUBAGENTS_TEST_EMPTY = "";
+		delete process.env.PI_SUBAGENTS_TEST_UNSET;
+		try {
+			assert.equal(computeMcpServerHash({ command: "node", env: { E: "${PI_SUBAGENTS_TEST_UNSET:-fallback}" } }), "63b3dd0b3af2e0d992f09b9ad3b5dc664e5a5b2be637efb7fd2ac5b049df1800");
+			assert.equal(computeMcpServerHash({ command: "node", env: { E: "${PI_SUBAGENTS_TEST_SET:-fallback}" } }), "e0ba06cbb914582d09692eb5567676e0440e89d49771feee60d203819bb2f75a");
+			assert.equal(computeMcpServerHash({ command: "node", env: { E: "${PI_SUBAGENTS_TEST_EMPTY:-fallback}" } }), "8d90759297b01c9017f3b000df7efb7b7fea6eb3137bab3d90c14059fc147fc3");
+			assert.equal(computeMcpServerHash({ url: "http://localhost/mcp", headers: { A: "${PI_SUBAGENTS_TEST_UNSET:-token}" } }), "dfe2954daf368fe0b2d99c360398ee02573a8ad8ba802540322ef4f9393e41b2");
+			assert.equal(computeMcpServerHash({ url: "${PI_SUBAGENTS_TEST_UNSET:-http://localhost:3000}/mcp" }), "8f950f5b7a4a5627a3facf5775dc18519ff6f66642e245f0f4c0285adaab8a4d");
+		} finally {
+			for (const name of names) delete process.env[name];
+		}
+	});
+
+	it("skips disabled server and tool selectors while resolving enabled servers", () => {
+		writeServerConfig(path.join(agentDir, "mcp-adapter.json"), CURRENT_DEFINITION);
+		writeServerConfig(path.join(getProjectConfigDir(projectDir), "mcp-adapter.json"), { disabled: true });
+		writeMetadataCache(CURRENT_DEFINITION);
+
+		const resolution = resolveMcpDirectToolResolution(["codegraph", "codegraph/codegraph_explore", "missing"], projectDir);
+		assert.deepEqual(resolution.selections, []);
+		assert.deepEqual(resolution.unresolvedSelectors, ["missing"]);
+
+		const mixed = resolveMcpDirectToolResolution(["disabled", "disabled/search", ...SELECTORS], projectDir, undefined, {
+			mcpServers: { disabled: { disabled: true }, codegraph: CURRENT_DEFINITION },
+		});
+		assert.deepEqual(mixed.selections.map((selection) => selection.name), SELECTED_NAMES);
+		assert.deepEqual(mixed.unresolvedSelectors, []);
+	});
+
+	it("does not grant default tools when every selected MCP server is disabled", () => {
+		writeServerConfig(path.join(getProjectConfigDir(projectDir), "mcp-adapter.json"), { disabled: true });
+		const plan = resolvePiLaunchToolPlan({ mcpDirectTools: ["codegraph"], cwd: projectDir });
+		assert.equal(plan.explicitToolAllowlist, true);
+		assert.deepEqual(plan.effectiveToolAllowlist, []);
+		assert.deepEqual(plan.requiredChildTools, []);
+	});
+
+	it("keeps a lower-priority disabled flag unless explicitly enabled", () => {
+		writeServerConfig(path.join(agentDir, "mcp-adapter.json"), { ...CURRENT_DEFINITION, disabled: true });
+		writeServerConfig(path.join(getProjectConfigDir(projectDir), "mcp-adapter.json"), { args: CURRENT_DEFINITION.args });
+		writeMetadataCache(CURRENT_DEFINITION);
+		assert.deepEqual(resolveMcpDirectToolResolution(SELECTORS, projectDir), { selections: [], unresolvedSelectors: [] });
+
+		writeServerConfig(path.join(getProjectConfigDir(projectDir), "mcp-adapter.json"), { disabled: false });
+		const enabled = resolveMcpDirectToolResolution(SELECTORS, projectDir);
+		assert.deepEqual(enabled.selections.map((selection) => selection.name), SELECTED_NAMES);
+		assert.deepEqual(enabled.unresolvedSelectors, []);
+	});
+
+	it("skips disabled selectors without a cache but still requires metadata for enabled selectors", () => {
+		const config = { mcpServers: { disabled: { disabled: true }, codegraph: CURRENT_DEFINITION, enabled: { disabled: false } } };
+		assert.deepEqual(resolveMcpDirectToolResolution(["disabled", "disabled/search"], projectDir, undefined, config), {
+			selections: [], unresolvedSelectors: [],
+		});
+		assert.deepEqual(resolveMcpDirectToolResolution(["disabled", "codegraph", "enabled", "missing"], projectDir, undefined, config).unresolvedSelectors,
+			["codegraph", "enabled", "missing"]);
 	});
 
 	it("ignores Pi's own mcp.json files, which the adapter no longer reads", () => {

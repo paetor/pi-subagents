@@ -1,12 +1,3 @@
-/**
- * Integration tests for async (background) agent execution.
- *
- * Tests the async support utilities: jiti availability check,
- * status file reading/caching.
- *
- * Requires pi packages to be importable. Skips gracefully if unavailable.
- */
-
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fsDefault from "node:fs";
@@ -21,6 +12,7 @@ import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
+import { primeBootId, resetBootIdForTesting } from "../../src/runs/background/boot-id.ts";
 import {
 	SUBAGENT_ASYNC_STARTED_EVENT,
 	SUBAGENT_CHILD_STATUS_EVENT,
@@ -35,6 +27,7 @@ import {
 	waitForAsyncState, waitForMockPiCall, readMockPiArgs, readMockPiRequiredTools,
 	tempDir, mockPi, makeAsyncExecutor, readAsyncPayload, launchProtocolTest,
 } from "../support/async-execution-fixture.ts";
+import { recoveryDescriptorPath } from "../../src/runs/shared/run-launch-folder.ts";
 
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	installAsyncExecutionHooks();
@@ -464,11 +457,19 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	it("persists terminal status with the result artifact", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "completed output" });
 		const id = `async-terminal-status-${Date.now().toString(36)}`;
-		launchProtocolTest(id);
-		await waitForAsyncResultFile(id);
-		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
-		assert.equal(status.state, "complete");
-		assert.equal(status.endedAt !== undefined, true);
+		// A value no OS reader returns: the runner's status can only carry it if it came through the runner config.
+		primeBootId("boot-id-from-parent-pi");
+		try {
+			launchProtocolTest(id);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")).bootId, "boot-id-from-parent-pi");
+			await waitForAsyncResultFile(id);
+			const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
+			assert.equal(status.state, "complete");
+			assert.equal(status.endedAt !== undefined, true);
+			assert.equal((status as AsyncStatusPayload & { bootId?: string }).bootId, "boot-id-from-parent-pi");
+		} finally {
+			resetBootIdForTesting();
+		}
 	});
 
 	it("preserves effective thinking in the completed async result artifact", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -637,7 +638,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			events: { emit() {} },
 			getCommands: () => [{ name: "mcp", sourceInfo: { path: "builtin:mcp" } }],
 			getAllTools: () => [["docs", "search"], ["docs", "fetch"], ["ext", "ping"]].map(([server, tool]) => ({ name: `mcp__${server}__${tool}`, exposure: "codemode", namespace: { name: `mcp__${server}` } })),
-			getMcpServers: () => [{ name: "ext" }],
+			getMcpServers: () => [{ name: "ext", extensionPath: "/opt/ambient/ext-mcp.ts" }],
 		};
 		const runForeground = (agent: ReturnType<typeof makeAgent>, projectTrusted?: boolean) => runSync(tempDir, [agent], agent.name, "Use MCP", { runtimeSnapshotHost: host, acceptance: false, projectTrusted });
 		const runBackground = async (agent: ReturnType<typeof makeAgent>) => {
@@ -668,7 +669,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.equal(background.processEnv?.MCP_DIRECT_TOOLS, "__none__");
 		});
 
-		it("grants extension-registered servers only to background children", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		it("grants servers that ambient extensions register only to background children", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 			const agent = makeAgent("worker", { tools: ["read"], mcpDirectTools: ["ext"] });
 			await assert.rejects(runForeground(agent), /extensions registered \(ext\)\. Only background children \(async: true\) load those extensions/);
 
@@ -676,6 +677,20 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			const background = await runBackground(agent);
 			assert.deepEqual(background.builtinMcpTools, [{ name: "mcp__ext__ping", selector: "ext" }]);
 			assert.equal(background.ambientExtensions, true);
+		});
+
+		it("grants a foreground child the servers its required child extensions register", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const agent = makeAgent("worker", { tools: ["read"], mcpDirectTools: ["ext"] });
+			const requiredPath = path.join(tempDir, "required-mcp.mjs");
+			fs.writeFileSync(requiredPath, "export default function () {}\n");
+			// Pi may report the extension under another spelling of the same file.
+			const linkedPath = path.join(tempDir, "required-mcp-link.mjs");
+			fs.linkSync(requiredPath, linkedPath);
+			const requiredHost = { ...host, getMcpServers: () => [{ name: "ext", extensionPath: linkedPath }] };
+			mockPi.onCall({ output: "foreground done" });
+			const result = await runSync(tempDir, [agent], agent.name, "Use MCP", { runtimeSnapshotHost: requiredHost, acceptance: false, requiredExtensions: [{ id: "ext-host", path: fs.realpathSync(requiredPath) }] });
+			assert.equal(result.exitCode, 0);
+			assert.deepEqual(mockPi.sessions.at(-1)!.launch.builtinMcpTools, [{ name: "mcp__ext__ping", selector: "ext" }]);
 		});
 
 		it("counts a project's .pi/mcp.json for foreground children only when the project is trusted", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -745,7 +760,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			intercomBridge: { mode: "off" },
 		});
 		assert.match(launch.details.launchContractDigest ?? "", /^[a-f0-9]{64}$/);
-		const recovery = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "recovery-descriptor.json"), "utf-8")) as { runFanoutBudget?: { rootRunId?: string; limit?: number }; context?: string; intercomBridge?: { mode?: string }; tools?: string[]; systemPrompt?: string };
+		const recovery = JSON.parse(fs.readFileSync(recoveryDescriptorPath(ASYNC_DIR, id), "utf-8")) as { runFanoutBudget?: { rootRunId?: string; limit?: number }; context?: string; intercomBridge?: { mode?: string }; tools?: string[]; systemPrompt?: string };
 		assert.deepEqual(recovery.runFanoutBudget && { rootRunId: recovery.runFanoutBudget.rootRunId, limit: recovery.runFanoutBudget.limit }, { rootRunId: id, limit: 64 });
 		assert.equal(recovery.context, "fork");
 		assert.deepEqual(recovery.intercomBridge, { mode: "off" });
@@ -1058,7 +1073,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const expectedDir = path.join(path.dirname(sessionFile), "subagent-artifacts");
 		assert.equal(launch.isError, undefined);
 		assert.ok(launch.details.asyncId);
-		const descriptor = JSON.parse(fs.readFileSync(path.join(launch.details.asyncDir!, "recovery-descriptor.json"), "utf-8"));
+		const descriptor = JSON.parse(fs.readFileSync(recoveryDescriptorPath(path.dirname(launch.details.asyncDir!), path.basename(launch.details.asyncDir!)), "utf-8"));
 		assert.equal(descriptor.artifactsDir, expectedDir);
 		assert.equal(descriptor.artifactConfig.dir, "session");
 
@@ -1304,6 +1319,19 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("applies a ceiling registered by session id to async launches from a saved session", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const ctx = makeMinimalCtx(tempDir);
+		// A saved session's file path differs from its session id, which is the documented registration key.
+		ctx.sessionManager.getSessionFile = () => path.join(tempDir, "parent.jsonl");
+		const handle = registerSubagentCapabilityCeiling({ sessionId: ctx.sessionManager.getSessionId(), source: "plan-mode", ceiling: { allowedAgents: ["reviewer"] } });
+		try {
+			const launch = await makeAsyncExecutor([makeAgent("worker"), makeAgent("reviewer")]).execute("ceiling-by-id", { agent: "worker", task: "Write", async: true }, new AbortController().signal, undefined, ctx);
+			assert.equal(launch.isError, true);
+			assert.match(launch.content[0]?.text ?? "", /Capability ceiling from plan-mode does not allow agent 'worker'/);
+			assert.equal(mockPi.callCount(), 0);
+		} finally { handle.dispose(); }
+	});
+
 	it("redacts async task text from durable artifacts, transcripts, and metadata", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "async redaction complete" });
 		const id = `async-prompt-redaction-${Date.now().toString(36)}`;
@@ -1481,6 +1509,16 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0]?.error, undefined);
 		assert.equal(payload.results[0]?.output, "settled async without a terminal assistant stop");
 		assert.ok(Date.now() - startedAt < 10_000, "agent_settled should trigger bounded child cleanup");
+	});
+
+	it("background fails a settled child whose final assistant response hit the length limit", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ jsonl: [mockAssistantMessage("partial async response", "length"), { type: "agent_settled" }], keepAliveAfterFinalMessageMs: 15_000 });
+		const id = `async-lifecycle-length-${Date.now().toString(36)}`;
+		launchProtocolTest(id);
+		const payload = await readAsyncPayload(id);
+		assert.equal(payload.success, false);
+		assert.equal(payload.results[0]?.error, "Response was truncated: the model reached its maximum output length.");
+		assert.equal(payload.results[0]?.output, "partial async response");
 	});
 
 	it("does not report successful compaction settlement as a failure", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

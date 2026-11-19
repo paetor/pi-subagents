@@ -13,7 +13,7 @@ export interface RunnerSubagentStep {
 	task: string;
 	runner?: ResolvedRunnerConfig;
 	/** Herdr saved machine this external-cli step runs on; `cwd` is then the directory on that machine. */
-	machine?: import("../../shared/types.ts").HerdrMachineReference;
+	machine?: import("../../shared/types.ts").PlacementMachineReference;
 	remoteReads?: string[] | false;
 	machineEnv?: Record<string, string>;
 	externalJobFollowUp?: {
@@ -23,7 +23,6 @@ export interface RunnerSubagentStep {
 		requestId: string;
 		requestDigest: string;
 	};
-	/** Resolved launch context for this child. */
 	context?: "fresh" | "fork";
 	importAsyncRoot?: {
 		runId: string;
@@ -51,6 +50,8 @@ export interface RunnerSubagentStep {
 	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string; contextWindow?: number }>;
 	modelResponseAliases?: Record<string, string[]>;
 	tools?: string[];
+	/** Provider of `model` that a parent extension registers; set only when this child loads no ambient extensions. */
+	parentExtensionProvider?: string;
 	excludeTools?: string[];
 	allowNestedSubagents?: boolean;
 	/** Resolved selected-agent policy for launches made by this child. */

@@ -3,6 +3,6 @@
   "kind": "subagents",
   "repository": "paetor/pi-subagents",
   "upstream": "nicobailon/pi-subagents",
-  "upstreamVersion": "0.79.1",
-  "upstreamBase": "95683a4427e1e4af8de03f1a9ca03ec4c2799b73"
+  "upstreamVersion": "0.89.1",
+  "upstreamBase": "533033f0e906e85fdb0e909ce27a7c499ffb6485"
 }

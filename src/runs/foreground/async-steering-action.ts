@@ -16,6 +16,10 @@ function steerTargetsAccepted(result: Pick<SteerActionResult, "targets"> | undef
 	return targets.length > 0 && targets.every((target) => target.state === "queued" || target.state === "delivered");
 }
 
+function steerTargetsRejected(result: SteerActionResult | undefined): boolean {
+	return result?.targets.some((target) => target.state === "failed" && target.failureKind === "rejected") === true;
+}
+
 export function canQueueRetainedAsyncFollowUp(status: AsyncStatus, index?: number): boolean {
 	const steps = status.steps ?? [];
 	return status.state === "complete"
@@ -86,10 +90,26 @@ export async function steerAsyncRun(input: {
 	}
 	const steps = status.steps ?? [];
 	if (status.state !== "running" && status.state !== "queued") {
-		const retained = input.mode === "follow_up" && canQueueRetainedAsyncFollowUp(status, input.index);
+		const followUpEligible = canQueueRetainedAsyncFollowUp(status, input.index);
+		const retained = input.mode === "follow_up" && followUpEligible;
 		if (!retained) {
+			// Name the terminal state and the next action so a steer that lost a race with
+			// completion does not look like a missing run. Mirrors the sibling nested/workflow errors.
+			// Offer resume only when the resume action's own target checks accept the run (it resolves without
+			// requiring a session file, as at subagent-executor's resume), and otherwise say why not.
+			let resumeHint = `Continue it with action "resume", or read its saved result.`;
+			try {
+				resolveAsyncResumeTarget({ dir: asyncDir, index: input.index }, { kill: input.kill }, { requireSessionFile: false, sessionId: input.state.currentSessionId ?? undefined });
+			} catch (error) {
+				resumeHint = `action "resume" is not available either: ${error instanceof Error ? error.message : String(error)}`;
+			}
+			const hint = followUpEligible
+				? `Queue this message for its next resume with mode "follow_up", or continue the run now with action "resume".`
+				: input.mode === "follow_up"
+					? `mode "follow_up" requires a completed single-child workflow run with a persisted session. ${resumeHint}`
+					: resumeHint;
 			return {
-				content: [{ type: "text", text: `Async run '${input.runId}' is not running or queued and cannot be steered.` }],
+				content: [{ type: "text", text: `Async run '${input.runId}' is ${status.state} and cannot be steered; steering requires state "running" or "queued". ${hint}` }],
 				isError: true,
 				details: { mode: "management", results: [] },
 			};
@@ -174,8 +194,10 @@ export async function steerAsyncRun(input: {
 	if (input.signal?.aborted) {
 		return { content: [{ type: "text", text: steeringReceipt(input.message, `Steering pending for async run ${status.runId} (request ${requestId}); caller aborted before recovery.`) }], details: { mode: "management", results: [], steering: result } };
 	}
+	const projected = (current: AsyncStatus | null) => current?.steering ? actionResultFromSteeringStatus(current.steering, status.runId, requestId) : undefined;
+	const rejected = () => new Error(`Child rejected the guidance; continue it with action "resume" and id "${status.runId}".`);
 	const finalStatus = readStatus(asyncDir);
-	const finalResult = finalStatus?.steering ? actionResultFromSteeringStatus(finalStatus.steering, status.runId, requestId) : undefined;
+	const finalResult = projected(finalStatus);
 	const acceptedReply = (accepted: SteerActionResult): AgentToolResult<Details> => {
 		const acceptedState = accepted.state === "delivered" ? "delivered" : "queued";
 		return { content: [{ type: "text", text: steeringReceipt(input.message, `Steering ${acceptedState} for async run ${status.runId} (request ${requestId}).`) }], details: { mode: "management", results: [], steering: accepted } };
@@ -183,7 +205,7 @@ export async function steerAsyncRun(input: {
 	if (finalResult && steerTargetsAccepted(finalResult)) return acceptedReply(finalResult);
 	const running = (finalStatus?.steps ?? status.steps ?? []).filter((step) => step.status === "running");
 	const recoveryAllowed = (input.mode ?? "steer") === "steer" && status.mode === "single" && status.isNested !== true && running.length === 1 && Boolean(finalStatus?.steering) && (input.index === undefined || input.index === 0);
-	if (recoveryAllowed && finalResult?.state !== "scheduled" && input.recover) {
+	if (recoveryAllowed && finalResult?.state !== "scheduled" && !steerTargetsRejected(finalResult) && input.recover) {
 		const appendSteeringNotice = (state: "failed" | "recovered", message: string): void => {
 			try {
 				fs.appendFileSync(path.join(asyncDir, "events.jsonl"), `${JSON.stringify({ type: "subagent.steering.notice", ts: Date.now(), runId: status.runId, requestId, state, message, ...(status.sessionId ? { currentSessionId: status.sessionId } : {}) })}\n`);
@@ -192,22 +214,22 @@ export async function steerAsyncRun(input: {
 			}
 		};
 		try {
-			const latest = readStatus(asyncDir);
-			const latestResult = latest?.steering ? actionResultFromSteeringStatus(latest.steering, status.runId, requestId) : undefined;
+			const latestResult = projected(readStatus(asyncDir));
 			if (latestResult && steerTargetsAccepted(latestResult)) return acceptedReply(latestResult);
+			if (steerTargetsRejected(latestResult)) throw rejected();
 			const committedAt = Date.now();
 			input.onBeforeRecoveryClaim?.(requestId, committedAt);
 			const { claimPath, markerPath } = claimSteeringRecovery(asyncDir, { requestId, sourceRunId: status.runId, committedAt });
 			input.onRecoveryCommitted?.(requestId, committedAt);
-			const preCommitStatus = readStatus(asyncDir);
-			const preCommitResult = preCommitStatus?.steering ? actionResultFromSteeringStatus(preCommitStatus.steering, status.runId, requestId) : undefined;
+			const preCommitResult = projected(readStatus(asyncDir));
 			if (
 				preCommitResult
-				&& preCommitResult.targets.length > 0
-				&& preCommitResult.targets.every((target) => target.state === "queued" || (target.deliveredAt !== undefined && target.deliveredAt <= committedAt))
+				&& (steerTargetsRejected(preCommitResult) || (preCommitResult.targets.length > 0
+					&& preCommitResult.targets.every((target) => target.state === "queued" || (target.deliveredAt !== undefined && target.deliveredAt <= committedAt))))
 			) {
 				fs.rmSync(markerPath, { force: true });
 				fs.rmSync(claimPath, { force: true });
+				if (steerTargetsRejected(preCommitResult)) throw rejected();
 				return acceptedReply(preCommitResult);
 			}
 			try {
@@ -217,15 +239,27 @@ export async function steerAsyncRun(input: {
 				fs.rmSync(claimPath, { force: true });
 				throw new Error(`Failed to commit steering recovery interrupt: ${error instanceof Error ? error.message : String(error)}`);
 			}
-			const pauseDeadline = Date.now() + (input.recoveryTimeoutMs ?? 15_000);
+			const pauseBudgetMs = input.recoveryTimeoutMs ?? 15_000;
+			const pauseDeadline = Date.now() + pauseBudgetMs;
 			let paused: AsyncStatus | null = null;
+			let lastObservedState: string | undefined;
 			while (Date.now() <= pauseDeadline) {
 				if (input.signal?.aborted) break;
 				const candidate = readStatus(asyncDir);
+				lastObservedState = candidate?.state;
+				if (steerTargetsRejected(projected(candidate))) {
+					fs.rmSync(claimPath, { force: true });
+					throw rejected();
+				}
 				if (candidate?.state === "paused" && candidate.endedAt !== undefined) { paused = candidate; break; }
 				await new Promise<void>((resolve) => setTimeout(resolve, 50));
 			}
-			if (!paused) throw new Error("Source run did not reach confirmed paused state within 15 seconds; no replacement was launched and the recovery claim remains committed to prevent a delayed duplicate.");
+			if (!paused) {
+				// The attempt is over, so release single-flight for later steers. Keep the marker so a late
+				// acknowledgment of this request is still recorded as late.
+				fs.rmSync(claimPath, { force: true });
+				throw new Error(`Source run did not confirm a paused state within ${pauseBudgetMs / 1000} seconds after the recovery interrupt (last observed state: ${lastObservedState ?? "unknown"}). No replacement was launched and the steering message was not applied. Once it pauses, continue it with action "resume" and id "${status.runId}".`);
+			}
 			let recoveryTarget;
 			try {
 				recoveryTarget = resolveAsyncResumeTarget(
@@ -239,6 +273,10 @@ export async function steerAsyncRun(input: {
 			if (recoveryTarget.kind !== "revive" || !recoveryTarget.sessionFile) throw new Error("Source run has no valid persisted child session; it remains paused and requires a new run.");
 			if (!recoveryTarget.recoveryDescriptor) throw new Error("Source run has no private recovery descriptor; it remains paused and is not safely resumable.");
 			const limits = remainingSteeringRecoveryLimits(recoveryTarget.recoveryDescriptor, paused);
+			if (steerTargetsRejected(projected(readStatus(asyncDir)))) {
+				fs.rmSync(claimPath, { force: true });
+				throw rejected();
+			}
 			const revived = await input.recover(limits);
 			if (revived.isError || !revived.details.asyncId) throw new Error(revived.content[0]?.type === "text" ? revived.content[0].text : "Replacement launch failed; source run remains paused.");
 			const targetIndex = input.index ?? paused.steering?.recent.find((request) => request.id === requestId)?.targets[0]?.index ?? status.steps?.findIndex((step) => step.status === "running") ?? -1;
@@ -262,7 +300,7 @@ export async function steerAsyncRun(input: {
 				failedStatus.activityState = "needs_attention";
 				writeAtomicJson(path.join(asyncDir, "status.json"), failedStatus);
 			}
-			const failed = failedStatus?.steering ? actionResultFromSteeringStatus(failedStatus.steering, status.runId, requestId) : undefined;
+			const failed = projected(failedStatus);
 			appendSteeringNotice("failed", `Steering failed for run ${status.runId}: ${reason}`);
 			return { content: [{ type: "text", text: steeringReceipt(input.message, `Steering failed for async run ${status.runId} (request ${requestId}): ${reason}`) }], isError: true, details: { mode: "management", results: [], steering: failed ?? { requestId, state: "failed", sourceRunId: status.runId, deliveryStatus: "queued", targets: [{ index: input.index ?? 0, state: "failed", reason }] } } };
 		}

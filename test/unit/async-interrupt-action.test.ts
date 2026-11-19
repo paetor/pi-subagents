@@ -195,9 +195,25 @@ describe("async interrupt action", () => {
 				const result = await executorWithKill(state, () => true)
 					.execute("interrupt", { action: "interrupt", id: "missing-exact-worker", ...extra }, new AbortController().signal, undefined, ctx());
 				assert.equal(result.isError, true);
+				assert.match(text(result), /'missing-exact-worker'/);
 				assert.equal(fs.existsSync(interruptRequestPath(asyncDir)), false);
 				assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8")).state, "running");
 			}
+		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("refuses a bare interrupt instead of picking a running job", async () => {
+		const state = createState();
+		const runId = `bare-interrupt-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, runId);
+		try {
+			const result = await executorWithKill(state, () => true)
+				.execute("interrupt", { action: "interrupt" }, new AbortController().signal, undefined, ctx());
+			assert.equal(result.isError, true);
+			assert.equal(text(result), "action='interrupt' requires id.");
+			assert.equal(fs.existsSync(interruptRequestPath(asyncDir)), false);
 		} finally {
 			cleanup(runId, asyncDir);
 		}
@@ -406,6 +422,9 @@ describe("async interrupt action", () => {
 		const childRunId = `${workflowRunId}-child`;
 		const workflowDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
 		const childDir = createRunningAsync(state, childRunId, { track: false });
+		// A runner that stopped updating a day ago is not finishing, so its result settles the status even if its pid is reused.
+		const childStatusPath = path.join(childDir, "status.json");
+		writeJson(childStatusPath, { ...JSON.parse(fs.readFileSync(childStatusPath, "utf-8")), lastUpdate: Date.now() - 2 * 24 * 60 * 60 * 1000 });
 		const workflowStatus = JSON.parse(fs.readFileSync(path.join(workflowDir, "status.json"), "utf-8"));
 		workflowStatus.steps = [{ agent: "worker", status: "completed", workflowKey: "writer", runId: childRunId, async: true }];
 		writeJson(path.join(workflowDir, "status.json"), workflowStatus);
@@ -1005,7 +1024,7 @@ describe("async interrupt action", () => {
 					{ ...pausedStatus.steps[1], processTerminal: { version: 1, state: "not-started", runId, childIndex: 1, runnerProcessInstanceId: "runner-stale" } },
 				],
 			});
-			const repaired = reconcileAsyncRun(asyncDir, { resultsDir: RESULTS_DIR, now: () => 400 }, () => {
+			const repaired = reconcileAsyncRun(asyncDir, { resultsDir: RESULTS_DIR, kill: () => { throw Object.assign(new Error("missing process"), { code: "ESRCH" }); }, now: () => 400 }, () => {
 				writeJson(sidecarPath, currentRoot);
 				writeJson(statusPath, currentStatus);
 			});
@@ -1408,7 +1427,7 @@ describe("async interrupt action", () => {
 				.execute("stop", { action: "stop", id: "missing-run" }, new AbortController().signal, undefined, ctx());
 
 			assert.equal(result.isError, true);
-			assert.match(text(result), /Run not found|No stoppable async run found in this session/);
+			assert.match(text(result), /No stoppable async run found for 'missing-run'/);
 			assert.equal(fs.existsSync(path.join(asyncDir, "control", "stop.json")), false);
 		} finally {
 			cleanup(runId, asyncDir);

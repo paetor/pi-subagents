@@ -4,8 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { collapseSystemMessages, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentTools, type FauxResponseFactory, type Message, type SystemMessage, type Tool } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
+import { buildInProcessChildLaunch, type InProcessChildCapture } from "../../src/runs/shared/child-launch.ts";
+import { formatChildToolDiagnostic } from "../../src/runs/shared/tool-availability.ts";
 import { topLevelSupervisorTool } from "../../src/intercom/native-supervisor-channel.ts";
 import { createDefaultChildSessionFactory } from "../../src/runs/shared/child-session.ts";
 import registerSubagentPromptRuntime, { applyForkSessionAffinity, modelBefore, projectForkRequest, stripParentOnlySubagentMessages, systemMessagesBefore } from "../../src/runs/shared/subagent-prompt-runtime.ts";
@@ -112,6 +114,38 @@ describe("a forked child's requests", () => {
 		assert.deepEqual(project(forkSession(), { boundary: "B" }), project(forkSession(), { boundary: "B" }));
 	});
 
+	describe("in another folder than the parent", () => {
+		/** A `project_context` section as Pi's system prompt builder writes it. */
+		const projectContext = (files: Array<[string, string]>) => `<project_context>\n${["Project-specific instructions and guidelines:", ...files.map(([filePath, content]) => `<project_instructions path="${filePath}">\n${content}\n</project_instructions>`)].join("\n\n")}\n</project_context>`;
+		const parentFiles: Array<[string, string]> = [["/home/me/.pi/agent/AGENTS.md", "Global rules."], ["/work/AGENTS.md", "Workspace rules."]];
+		const session = (childFiles: Array<[string, string]>): Message[] => [
+			system(10, { content: "Parent base prompt.", sections: { preamble: "<preamble>parent</preamble>", project_context: projectContext(parentFiles) }, added: [tool("a")] }),
+			user(20, "parent question"),
+			system(FORKED_AT + 1, { sections: { project_context: projectContext(childFiles) } }),
+			user(FORKED_AT + 2, "child task"),
+		];
+
+		it("carry the project instruction files the parent's prompt lacks in the task message", () => {
+			const task = text(project(session([...parentFiles, ["/work/repo/AGENTS.md", "Repo rules."], ["/work/repo/pkg/CLAUDE.md", "Package rules."]]), { boundary: "B" }).at(-1));
+
+			assert.ok(task.includes([
+				"Project instructions for your working folder, which the parent's prompt does not include:",
+				"<project_instructions path=\"/work/repo/AGENTS.md\">\nRepo rules.\n</project_instructions>",
+				"<project_instructions path=\"/work/repo/pkg/CLAUDE.md\">\nPackage rules.\n</project_instructions>",
+			].join("\n\n")), task);
+			assert.match(task, /<\/project_instructions>\n\nB\n<\/subagent_instructions>\n\nchild task$/);
+			assert.doesNotMatch(task, /Global rules|Workspace rules|Project-specific instructions/, "the parent's own files are not repeated");
+		});
+
+		it("add nothing when the child has the parent's project instruction files", () => {
+			const sameFiles = project(session(parentFiles), { boundary: "B" });
+			const noFiles = project(session([]).filter((message) => message.timestamp !== FORKED_AT + 1), { boundary: "B" });
+
+			assert.deepEqual(sameFiles.map(text), noFiles.map(text));
+			assert.doesNotMatch(text(sameFiles.at(-1)), /project_instructions|Project instructions/);
+		});
+	});
+
 	it("keep the instructions as a system section when the child has not written a user message", () => {
 		const messages = [parentHead, user(20), system(FORKED_AT + 1, { sections: { addendum: "<addendum>CHILD ROLE</addendum>" } })];
 
@@ -176,25 +210,27 @@ describe("a forked child session", () => {
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 
-	type Request = { tools: string[]; declarations: string; results: Message[]; messages: Message[] };
+	type Request = { tools: string[]; declarations: string; results: Message[]; messages: Message[]; aborted: boolean };
 
-	/** Runs a real SDK session on `sessionFile` and returns what each provider request declared. */
 	type Launch = Partial<Parameters<typeof buildInProcessChildLaunch>[0]>;
-	async function run(options: { sessionFile: string; tools: string[]; replies: Array<ReturnType<typeof fauxAssistantMessage>>; forkCacheKey?: string; launch?: Launch; hooks?: Array<(pi: ExtensionAPI) => void> }): Promise<Request[]> {
+	/** Runs a real SDK session on `sessionFile` and returns what each provider request declared. */
+	async function run(options: { sessionFile: string; tools: string[]; replies: Array<ReturnType<typeof fauxAssistantMessage>>; forkCacheKey?: string; launch?: Launch; hooks?: Array<(pi: ExtensionAPI) => void>; capture?: (capture: InProcessChildCapture) => void }): Promise<Request[]> {
 		const faux = fauxProvider({ provider: "probe", models: [{ id: "local" }], tokensPerSecond: 100_000 });
 		const requests: Request[] = [];
-		faux.setResponses(options.replies.map((message): FauxResponseFactory => (context) => {
+		faux.setResponses(options.replies.map((message): FauxResponseFactory => (context, streamOptions) => {
 			const messages = context.messages as Message[];
 			const declarations = JSON.stringify(getCurrentTools(messages).map(({ name, description, parameters }) => ({ name, description, parameters })));
-			requests.push({ tools: declared(messages), declarations, results: messages.filter((entry) => entry.role === "toolResult"), messages });
+			// pi-ai's providers check the signal before sending, so an already-aborted request counts as not sent.
+			requests.push({ tools: declared(messages), declarations, results: messages.filter((entry) => entry.role === "toolResult"), messages, aborted: streamOptions?.signal?.aborted === true });
 			return message;
 		}));
-		const { session } = buildInProcessChildLaunch({
+		const { session, capture } = buildInProcessChildLaunch({
 			host: "parent", cwd: root, childAgentName: "worker", childIndex: 0, sessionEnabled: true, sessionFile: options.sessionFile, waitToolEnabled: false,
 			model: "probe/local", systemPrompt: "Role instructions.", systemPromptMode: "append", tools: options.tools,
 			...(options.forkCacheKey ? { forkCacheKey: options.forkCacheKey } : {}),
 			...options.launch,
 		});
+		options.capture?.(capture);
 		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: () => import("@earendil-works/pi-coding-agent") });
 		const hooks = [(pi: ExtensionAPI) => pi.registerProvider(faux.provider as never), ...options.hooks ?? []];
 		const child = await factory.create({ ...session, hooks: [...session.hooks, ...hooks.map((hook, index) => ({ name: `probe-${index}`, factory: hook }))] });
@@ -334,6 +370,57 @@ describe("a forked child session", () => {
 			assert.doesNotMatch(JSON.stringify(messages), /PARENT-NOTICE/);
 		}
 	});
+
+	/** Stands in for an extension like pi-fabric's code mode, which sends only its own tool to the model. */
+	const replaceDeclaredTools = (pi: ExtensionAPI) => pi.on("context_with_system", (event) => {
+		let first = true;
+		return { messages: event.messages.map((message) => {
+			if (message.role !== "system") return message;
+			const { toolsAdded: _added, toolsRemoved: _removed, ...rest } = message as SystemMessage;
+			const head = first ? { toolsAdded: [tool("fabric_exec")] } : {};
+			first = false;
+			return { ...rest, ...head } as SystemMessage;
+		}) };
+	});
+
+	it("with a tools allowlist, fails before the provider gets a request whose tools an extension replaced", async () => {
+		let capture: InProcessChildCapture | undefined;
+		const requests = await run({ sessionFile: path.join(root, "replaced.jsonl"), tools: ["read", "grep"], replies: [fauxAssistantMessage("done")], hooks: [replaceDeclaredTools], capture: (value) => { capture = value; } });
+
+		assert.deepEqual(requests.filter((request) => !request.aborted), [], "no request reached the provider");
+		const diagnostic = capture!.toolDiagnostic();
+		assert.ok(diagnostic);
+		const message = formatChildToolDiagnostic(diagnostic, { host: "parent" });
+		assert.match(message, /^Agent 'worker' declares tools: read, grep, but an extension loaded in this child replaced the tools sent to the model: it left out read, grep and added fabric_exec, which this child cannot call\./);
+		assert.match(message, /Set `extensions: \[\]`/);
+	});
+
+	it("with a tools allowlist, sends a request that leaves out an allowlisted tool an extension keeps inactive", async () => {
+		// Stands in for pi-web-access, which registers `web_enable` and leaves it inactive with setActiveTools.
+		const inactiveLoader = (pi: ExtensionAPI) => {
+			pi.registerTool({ name: "web_enable", label: "Web enable", description: "Load the web tools", parameters: Type.Object({}), async execute() {
+				return { content: [{ type: "text", text: "loaded" }], details: {} };
+			} });
+			pi.on("session_start", () => pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "web_enable")));
+		};
+		let capture: InProcessChildCapture | undefined;
+		const requests = await run({ sessionFile: path.join(root, "inactive.jsonl"), tools: ["read", "web_enable"], replies: [fauxAssistantMessage("done")], hooks: [inactiveLoader], capture: (value) => { capture = value; } });
+
+		assert.equal(requests.length, 1);
+		assert.equal(requests[0]!.aborted, false);
+		assert.deepEqual(requests[0]!.tools, ["read"]);
+		assert.equal(capture!.toolDiagnostic(), undefined);
+	});
+
+	it("without a tools allowlist, sends the tools that extension declares", async () => {
+		let capture: InProcessChildCapture | undefined;
+		const requests = await run({ sessionFile: path.join(root, "replaced-no-allowlist.jsonl"), tools: [], launch: { tools: undefined }, replies: [fauxAssistantMessage("done")], hooks: [replaceDeclaredTools], capture: (value) => { capture = value; } });
+
+		assert.equal(requests.length, 1);
+		assert.equal(requests[0]!.aborted, false);
+		assert.deepEqual(requests[0]!.tools, ["fabric_exec"]);
+		assert.equal(capture!.toolDiagnostic(), undefined);
+	});
 });
 
 describe("a child's context handler", () => {
@@ -344,8 +431,8 @@ describe("a child's context handler", () => {
 			registerTool: () => {},
 			events: { on: () => () => {} },
 		} as never, { fanoutChild: false, depth: 1, waitTool: { enabled: false }, fast: false, ...config });
-		const ctx = { model: { api: "anthropic-messages" }, sessionManager: { getHeader: () => ({ id: "fork", timestamp: new Date(FORKED_AT).toISOString() }) } };
-		return (messages: unknown[]) => (handlers.get("context")!({ messages }, ctx) as { messages: unknown[] } | undefined)?.messages ?? messages;
+		const ctx = { model: { api: "anthropic-messages" }, sessionManager: { getHeader: () => ({ id: "fork", timestamp: new Date(FORKED_AT).toISOString() }), buildSessionProjection: () => ({ messages: [] }) } };
+		return (messages: unknown[]) => (handlers.get("context_with_system")!({ messages }, ctx) as { messages: unknown[] } | undefined)?.messages ?? messages;
 	};
 	const notice = (timestamp: number) => ({ role: "custom", customType: "subagent-notify", content: "done", display: false, timestamp });
 	const call = (timestamp: number) => ({ role: "assistant", content: [{ type: "toolCall", id: `call_${timestamp}`, name: "subagent", arguments: {} }], timestamp });

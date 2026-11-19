@@ -5,7 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
-import { SUBAGENT_OPTION_KEYS } from "../../src/extension/schemas.ts";
+import { SUBAGENT_OPTION_KEYS, createSubagentParamsSchema } from "../../src/extension/schemas.ts";
+import { normalizePublicSubagentExecution } from "../../src/extension/public-execution.ts";
 import { flattenSubagentToolOptions } from "../../src/extension/subagent-options.ts";
 import { resolveDisabledFeatureSurface } from "../../src/shared/disabled-features.ts";
 import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/subagent-wait.ts";
@@ -15,8 +16,8 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 
 // One valid value per management/control field the model passes inside options.
 const OPTION_SAMPLES: Record<string, unknown> = {
-	extensionBindings: { "pkg/1": {} }, capabilities: true, name: "nightly", dir: "/tmp/run", handoffPath: "handoff.json",
-	repo: "/repo", planId: "plan-1", laneId: "lane-1", merge: {}, supersession: {}, index: 0, childId: "child-1",
+	extensionBindings: { "pkg/1": {} }, capabilities: true, search: "review", name: "nightly", dir: "/tmp/run", handoffPath: "handoff.json",
+	repo: "/repo", planId: "plan-1", laneId: "lane-1", merge: {}, supersession: {}, index: 0, childId: "child-1", drain: true,
 	toolCallId: "call-1", view: "transcript", lines: 5, topic: "workflows", mode: "follow_up", steeringRecovery: false,
 	additional: 1, scope: "session", target: "children", focus: true, thinking: "low", at: "10m", every: "1h",
 	sessionOnly: true, quiet: true, on: ["mon"], timezone: "UTC", overlap: "skip", catchUp: "none", missionId: "mission-1",
@@ -27,6 +28,7 @@ const OPTION_SAMPLES: Record<string, unknown> = {
 	usageBudget: { tokens: { hard: 10 } }, agentScope: "user", machine: "box", artifacts: false, includeProgress: true,
 	share: false, sessionDir: "/tmp/sessions", control: { enabled: false }, outputMode: "file-only", skill: "review",
 	fast: false, outputSchema: { type: "object" }, agentContract: { version: 1 }, acceptance: "checked", gate: "npm test", maxOutput: { bytes: 1000 },
+	requireLauncher: { name: "net", definitionDigest: "a".repeat(64) },
 };
 
 describe("subagent tool options", () => {
@@ -41,6 +43,31 @@ describe("subagent tool options", () => {
 		assert.deepEqual(flattenSubagentToolOptions(flat), flat);
 		assert.deepEqual(flattenSubagentToolOptions({ action: "status", view: "fleet", options: { view: "fleet", lines: 5 } }), { action: "status", view: "fleet", lines: 5 });
 		assert.throws(() => flattenSubagentToolOptions({ action: "status", view: "fleet", lines: 5, options: { view: "transcript", lines: 6 } }), { message: "subagent: 'view', 'lines' given both at the top level and in options with different values; give each once." });
+	});
+
+	it("takes requireLauncher only from options, so the tool schema the model sees does not change", () => {
+		const requireLauncher = { name: "net", definitionDigest: "a".repeat(64) };
+		assert.deepEqual(flattenSubagentToolOptions({ agent: "worker", task: "scan", options: { requireLauncher } }), { agent: "worker", task: "scan", requireLauncher });
+		assert.throws(() => flattenSubagentToolOptions({ agent: "worker", task: "scan", options: { requireLauncher: { name: "net", definitionDigest: "ABC" } } }), /options\.requireLauncher\.definitionDigest must match pattern/);
+		assert.throws(() => flattenSubagentToolOptions({ agent: "worker", task: "scan", options: { requireLauncher: { name: "-net", definitionDigest: "a".repeat(64) } } }), /options\.requireLauncher\.name must match pattern/);
+		assert.throws(() => flattenSubagentToolOptions({ agent: "worker", task: "scan", options: { requireLauncher: { name: "net" } } }), /options\.requireLauncher must have required properties definitionDigest/);
+		assert.equal(JSON.stringify(createSubagentParamsSchema()).includes("requireLauncher"), false);
+	});
+
+	it("converts option scalars a provider sent as strings to their declared types", () => {
+		assert.deepEqual(flattenSubagentToolOptions({ action: "list", options: { capabilities: "true" } }), { action: "list", capabilities: true });
+		assert.deepEqual(flattenSubagentToolOptions({ agent: "worker", task: "scan", options: { timeoutMs: "120000", toolBudget: { hard: "3" } } }), { agent: "worker", task: "scan", timeoutMs: 120000, toolBudget: { hard: 3 } });
+		assert.deepEqual(flattenSubagentToolOptions({ agent: "worker", task: "scan", options: { skill: "false", thinking: "false" } }), { agent: "worker", task: "scan", skill: "false", thinking: "false" });
+		assert.throws(() => flattenSubagentToolOptions({ agent: "worker", task: "scan", options: { timeoutMs: "soon" } }), /options\.timeoutMs must be integer/);
+	});
+
+	it("treats the \"null\" and workflow \"false\" placeholders some models send as omitted fields (#3285)", () => {
+		const workflowCall = flattenSubagentToolOptions({ action: "null", agent: "null", task: "null", workflow: "true", id: "null", message: "null", model: "null", output: "null", cwd: "null", options: {}, async: true, worktree: false });
+		assert.deepEqual(workflowCall, { workflow: "true", async: true, worktree: false });
+		assert.deepEqual(normalizePublicSubagentExecution(workflowCall), { ok: true, params: { workflow: true, async: true, worktree: false } });
+		assert.deepEqual(flattenSubagentToolOptions({ action: "validate", agent: "null", task: "null", workflow: "./review.workflow.js" }), { action: "validate", workflow: "./review.workflow.js" });
+		assert.deepEqual(flattenSubagentToolOptions({ action: "list", id: "null", workflow: "false" }), { action: "list" });
+		assert.deepEqual(flattenSubagentToolOptions({ agent: "reviewer", task: "check for null", workflow: "false", options: { timeoutMs: "null", skill: "review" } }), { agent: "reviewer", task: "check for null", skill: "review" });
 	});
 
 	it("points typos, aliases and top-level fields inside options to the field to use", () => {
@@ -94,6 +121,8 @@ describe("registered subagent tools with options", () => {
 			await assert.rejects(call({ action: "status", id: "missing-run", options: { view: "transcript", lines: 5 } }), /Transcript target: run missing-run/);
 			await assert.rejects(call({ action: "steer", id: "missing-run", message: "focus", options: { mode: "plan" } }), /action='steer' mode must be/);
 			assert.match(text(await call({ action: "schedule.create", workflow: "./flow.js", options: { every: "1h", name: "nightly" } })), /Trigger: every 1h/);
+			assert.match(text(await call({ action: "validate", options: { script: "return 1;" } })), /"ok":true/);
+			await assert.rejects(call({ workflow: true, options: { script: "return 1;" } }), /options\.script replaces workflow/);
 			await assert.rejects(call({ agent: "worker", task: "scan", options: { acceptance: "checked", timeoutMs: 3000000000 } }), /timeoutMs must be a positive integer no larger/);
 			const theme = { fg(_name, value) { return value; }, bold(value) { return value; } };
 			assert.match(tools.parent.renderCall({ workflow: true, options: { preflight: { version: 1, lanes: [] } } }, theme).text, /preflight/);

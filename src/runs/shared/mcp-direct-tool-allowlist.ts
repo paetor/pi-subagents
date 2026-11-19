@@ -40,7 +40,6 @@ export interface McpConfig {
 	imports?: ImportKind[];
 	settings?: {
 		toolPrefix?: McpToolPrefix;
-		directTools?: boolean;
 		agentPluginPaths?: unknown;
 	};
 }
@@ -70,7 +69,7 @@ export interface McpRuntimeSnapshotHost {
 	getAllTools?(): readonly McpHostToolInfo[];
 	getCommands?(): readonly { name: string; sourceInfo: { path: string } }[];
 	/** Pi 0.99: servers extensions added with `pi.registerMcpServer()`. */
-	getMcpServers?(): readonly { name: string }[];
+	getMcpServers?(): readonly { name: string; extensionPath: string }[];
 }
 
 /** A `pi.getAllTools()` entry; `exposure` and `namespace` exist only from Pi 0.99. */
@@ -130,19 +129,22 @@ export function resolveMcpDirectToolResolution(
 	const resolvedConfig = Object.keys(runtimeServers).length > 0
 		? mergeConfigs(config, { mcpServers: runtimeServers })
 		: config;
-	validateSelectedServerDefinitions(resolvedConfig, selectors);
+	const enabledSelectors = selectors.filter((selector) => resolvedConfig.mcpServers[selector.split("/", 1)[0]!]?.disabled !== true);
+	validateSelectedServerDefinitions(resolvedConfig, enabledSelectors);
 	const runtime = Object.keys(runtimeServers).length > 0
 		? { mcpConfig: resolvedConfig, runtimeServerNames: Object.keys(runtimeServers) }
 		: {};
+	if (enabledSelectors.length === 0) return { selections: [], unresolvedSelectors: [], ...runtime };
 	const cache = loadMetadataCache();
-	if (!cache) return { selections: [], unresolvedSelectors: selectors, ...runtime };
+	if (!cache) return { selections: [], unresolvedSelectors: enabledSelectors, ...runtime };
 	const validMetadata: Record<string, ServerCacheEntry> = {};
 	for (const [serverName, definition] of Object.entries(resolvedConfig.mcpServers)) {
+		if (definition.disabled === true) continue;
 		const serverCache = cache.servers[serverName];
 		if (isServerCacheValid(serverCache, definition)) validMetadata[serverName] = serverCache;
 	}
 	const grant = planMcpDirectToolGrant({
-		selectors,
+		selectors: enabledSelectors,
 		servers: resolvedConfig.mcpServers,
 		metadata: validMetadata,
 		toolPrefix: resolvedConfig.settings?.toolPrefix,
@@ -152,14 +154,6 @@ export function resolveMcpDirectToolResolution(
 		unresolvedSelectors: grant.unresolvedSelectors,
 		...runtime,
 	};
-}
-
-export function resolveMcpDirectToolSelections(
-	mcpDirectTools: string[] | undefined,
-	cwd = process.cwd(),
-	runtimeSnapshotHost?: McpRuntimeSnapshotHost,
-): ResolvedMcpDirectToolSelection[] {
-	return resolveMcpDirectToolResolution(mcpDirectTools, cwd, runtimeSnapshotHost).selections;
 }
 
 /**
@@ -214,11 +208,12 @@ export function formatUnresolvedBuiltinMcpSelectors(agentName: string | undefine
 
 /**
  * Selected servers that only an extension registered, which a child without ambient extensions
- * never has. A server of the same name in an `mcp.json` the child reads takes precedence; like Pi,
- * the project file is read only when the project is trusted.
+ * never has unless the registering extension is one the child loads (`loadedByChild`). A server of
+ * the same name in an `mcp.json` the child reads takes precedence; like Pi, the project file is read
+ * only when the project is trusted.
  */
-export function extensionOnlyMcpServers(selections: readonly ResolvedMcpDirectToolSelection[], host: McpRuntimeSnapshotHost, cwd: string, projectTrusted: boolean): string[] {
-	const registered = new Set(host.getMcpServers?.().map(({ name }) => name));
+export function extensionOnlyMcpServers(selections: readonly ResolvedMcpDirectToolSelection[], host: McpRuntimeSnapshotHost, cwd: string, projectTrusted: boolean, loadedByChild: (extensionPath: string) => boolean): string[] {
+	const registered = new Set(host.getMcpServers?.().filter(({ extensionPath }) => !loadedByChild(extensionPath)).map(({ name }) => name));
 	const servers = [...new Set(selections.map(({ selector }) => selector.split("/")[0]!))].filter((server) => registered.has(server));
 	if (servers.length === 0) return [];
 	const files = [path.join(getAgentDir(), "mcp.json"), ...(projectTrusted ? [path.join(cwd, ".pi", "mcp.json")] : [])];
@@ -392,10 +387,8 @@ function parseServerEntries(value: unknown): Record<string, ServerEntry> {
 function parseSettings(value: unknown): McpConfig["settings"] | undefined {
 	if (!isRecord(value)) return undefined;
 	const toolPrefix = value.toolPrefix === "server" || value.toolPrefix === "short" || value.toolPrefix === "none" || value.toolPrefix === "mcp" ? value.toolPrefix : undefined;
-	const directTools = typeof value.directTools === "boolean" ? value.directTools : undefined;
 	const settings: NonNullable<McpConfig["settings"]> = {
 		...(toolPrefix ? { toolPrefix } : {}),
-		...(directTools !== undefined ? { directTools } : {}),
 		...(value.agentPluginPaths !== undefined ? { agentPluginPaths: value.agentPluginPaths } : {}),
 	};
 	return Object.keys(settings).length ? settings : undefined;
@@ -404,10 +397,20 @@ function parseSettings(value: unknown): McpConfig["settings"] | undefined {
 function mergeConfigs(base: McpConfig, next: McpConfig): McpConfig {
 	const imports = [...(base.imports ?? []), ...(next.imports ?? [])];
 	return {
-		mcpServers: { ...base.mcpServers, ...next.mcpServers },
+		mcpServers: mergeServerDefinitions(base.mcpServers, next.mcpServers),
 		imports: imports.length ? [...new Set(imports)] : undefined,
 		settings: next.settings ? { ...base.settings, ...next.settings } : base.settings,
 	};
+}
+
+function mergeServerDefinitions(base: Record<string, ServerEntry>, next: Record<string, ServerEntry>): Record<string, ServerEntry> {
+	const servers = { ...base };
+	for (const [name, definition] of Object.entries(next)) {
+		const previous = base[name];
+		if (previous && Object.keys(definition).every((key) => key === "disabled")) servers[name] = { ...previous, ...definition };
+		else servers[name] = previous?.disabled === undefined ? definition : { disabled: previous.disabled, ...definition };
+	}
+	return servers;
 }
 
 function expandImports(config: McpConfig, cwd: string): McpConfig {
@@ -431,7 +434,7 @@ function expandImports(config: McpConfig, cwd: string): McpConfig {
 	return {
 		imports: config.imports,
 		settings: config.settings,
-		mcpServers: { ...importedServers, ...config.mcpServers },
+		mcpServers: mergeServerDefinitions(importedServers, config.mcpServers),
 	};
 }
 
@@ -450,10 +453,6 @@ function extractServers(config: unknown, kind: ImportKind): Record<string, Serve
 		? obj.mcpServers ?? obj["mcp-servers"]
 		: obj.mcpServers;
 	return parseServerEntries(servers);
-}
-
-export function resolveMcpDirectToolNames(mcpDirectTools: string[] | undefined, cwd = process.cwd()): string[] {
-	return resolveMcpDirectToolSelections(mcpDirectTools, cwd).map((selection) => selection.name);
 }
 
 function validateSelectedServerDefinitions(config: McpConfig, selectors: string[]): void {
@@ -518,7 +517,8 @@ function interpolateEnvRecord(values: Record<string, string> | undefined): Recor
 
 function interpolateEnvVars(value: string): string {
 	return value
-		.replace(/\$\{(\w+)\}/g, (_, name: string) => process.env[name] ?? "")
+		// `${NAME:-default}` uses the default only when NAME is unset, as pi-mcp-adapter and Claude Code do.
+		.replace(/\$\{(\w+)(?::-([^}]*))?\}/g, (_, name: string, fallback: string | undefined) => process.env[name] ?? fallback ?? "")
 		.replace(/\$env:(\w+)/g, (_, name: string) => process.env[name] ?? "")
 		.replace(/\{env:(\w+)\}/g, (_, name: string) => process.env[name] ?? "");
 }
@@ -530,9 +530,9 @@ function interpolateSecretExpression(value: string): string {
 
 function getMissingEnvVars(value: string): string[] {
 	const missing = new Set<string>();
-	for (const match of value.matchAll(/\$\{(\w+)\}|\$env:(\w+)|\{env:(\w+)\}/g)) {
-		const name = match[1] ?? match[2] ?? match[3];
-		if (name && process.env[name] === undefined) missing.add(name);
+	for (const match of value.matchAll(/\$\{(\w+)(:-[^}]*)?\}|\$env:(\w+)|\{env:(\w+)\}/g)) {
+		const name = match[1] ?? match[3] ?? match[4];
+		if (name && match[2] === undefined && process.env[name] === undefined) missing.add(name);
 	}
 	return [...missing];
 }

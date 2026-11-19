@@ -11,6 +11,7 @@ import {
 	resolveModelSelection,
 	resolveSubagentModelOverride,
 } from "../../src/runs/shared/model-resolution.ts";
+import { TRUNCATED_RESPONSE_ERROR } from "../../src/shared/utils.ts";
 import { resolveModelScopesForAgent } from "../../src/runs/shared/model-scope.ts";
 
 const models = [
@@ -72,6 +73,25 @@ describe("single model resolution", () => {
 		assert.equal(normalizeModelSegment("GPT_5--MINI"), "gpt-5-mini");
 		assert.equal(fuzzyResolveModel("GPT_5_MINI", models), "openai/gpt-5-mini");
 		assert.equal(resolveModelCandidate("openai/claude-sonnet-4", models), "openai/claude-sonnet-4");
+	});
+
+	it("never resolves a provider the user is not signed in to under another provider", () => {
+		// Pi knows anthropic but has no auth for it; OpenRouter re-lists the same model as `anthropic/...`.
+		const registry = [
+			{ provider: "llama-cpp", id: "qwen", fullId: "llama-cpp/qwen" },
+			{ provider: "openrouter", id: "anthropic/claude-opus-4.8", fullId: "openrouter/anthropic/claude-opus-4.8" },
+		];
+		const knownProviders = () => ["anthropic", "llama-cpp", "openrouter"];
+		const parent = { provider: "llama-cpp", id: "qwen" };
+		for (const requested of ["anthropic/claude-opus-4-8", "anthropic/claude-opus-4.8"]) {
+			assert.throws(
+				() => resolveSubagentModelOverride(requested, parent, registry, undefined, { source: "explicit", knownProviders }),
+				new RegExp(`Unknown subagent model '${requested.replace(/[./]/g, "\\$&")}'.*Did you mean 'openrouter/anthropic/claude-opus-4\\.8'`),
+			);
+			assert.throws(() => resolveModelSelection(requested, registry, undefined, { knownProviders }), /Unknown subagent model/);
+		}
+		assert.equal(resolveSubagentModelOverride("openrouter/anthropic/claude-opus-4.8", parent, registry, undefined, { source: "explicit", knownProviders }), "openrouter/anthropic/claude-opus-4.8");
+		assert.equal(resolveModelCandidate("org/model-v1", models, undefined, () => ["openai", "anthropic", "huggingface"]), "huggingface/org/model-v1");
 	});
 
 	it("resolves ids that already carry their provider prefix within that provider", () => {
@@ -156,6 +176,7 @@ describe("context overflow classification", () => {
 	it("does not classify tool failures, provider failures, or empty input as overflow", () => {
 		assert.equal(isContextOverflow("bash failed (exit 1): input too long"), false);
 		assert.equal(isContextOverflow("429 rate limit exceeded"), false);
+		assert.equal(isContextOverflow(TRUNCATED_RESPONSE_ERROR), false);
 		assert.equal(isContextOverflow(undefined), false);
 	});
 });

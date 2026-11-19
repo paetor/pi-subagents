@@ -1,9 +1,12 @@
+import { hashedSegment } from "../runs/background/index-segment.ts";
 import type { AgentProgress, AsyncStatus, WorkflowChildActivity, WorkflowChildSummary } from "../shared/types.ts";
 import type { WorkflowScriptChildResult, WorkflowScriptTraceEntry } from "./scripted-workflow.ts";
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const TERMINAL_STATES = new Set(["completed", "failed", "paused", "stopped", "rejected", "detached"]);
 const MAX_REQUIRED_ID_BYTES = 4_096;
+/** Linux PATH_MAX: a longer session path cannot be opened anyway. */
+const MAX_SESSION_FILE_BYTES = 4_096;
 const ACTIVITY_COUNTERS = ["currentToolStartedAt", "lastActivityAt", "durationMs", "toolCount", "turnCount", "tokens", "inputTokens", "outputTokens"] as const;
 type WorkflowChildLiveProgress = WorkflowChildActivity & Pick<AgentProgress, "agent" | "sessionName" | "model" | "thinking">;
 
@@ -49,6 +52,12 @@ function requiredId(value: string, label: string): string {
 	return id;
 }
 
+/** Provider tool-call ids can be multi-kilobyte; the verbatim id stays in AsyncStatus.toolCallId, so an oversize id is recorded as its digest. */
+function parentToolCallId(value: string, label: string): string {
+	if (typeof value === "string" && value.trim() && Buffer.byteLength(value, "utf8") > MAX_REQUIRED_ID_BYTES) return hashedSegment(value);
+	return requiredId(value, label);
+}
+
 export function workflowChildSummary(input: {
 	parentToolCallId: string;
 	workflowRunId: string;
@@ -59,8 +68,8 @@ export function workflowChildSummary(input: {
 	steps?: NonNullable<AsyncStatus["steps"]>;
 	/** In-memory snapshots from synchronous child callbacks, keyed by workflow key. */
 	progress?: ReadonlyMap<string, WorkflowChildLiveProgress>;
-	/** Agent and run id each child launched with, keyed by workflow key; known before an async child settles. */
-	launches?: ReadonlyMap<string, { agent: string; runId?: string }>;
+	/** Agent, run id and session file each child launched with, keyed by workflow key; known before an async child settles. */
+	launches?: ReadonlyMap<string, { agent: string; runId?: string; sessionFile?: string }>;
 }): WorkflowChildSummary {
 	const rows = new Map<string, WorkflowChildSummary["children"][number]>();
 	const runningAsyncKeys = new Set(input.children?.filter((child) => child.state === "running").map((child) => child.key));
@@ -78,6 +87,7 @@ export function workflowChildSummary(input: {
 			...(bounded(entry.runId, 256) ? { runId: bounded(entry.runId, 256) } : {}),
 			...(previous?.agent ? { agent: previous.agent } : {}),
 			...(previous?.sessionName ? { sessionName: previous.sessionName } : {}),
+			...(previous?.sessionFile ? { sessionFile: previous.sessionFile } : {}),
 			...(previous?.model ? { model: previous.model } : {}),
 			...(previous?.thinking ? { thinking: previous.thinking } : {}),
 		});
@@ -99,6 +109,7 @@ export function workflowChildSummary(input: {
 			...(bounded(step.runId, 256) ? { runId: bounded(step.runId, 256) } : {}),
 			...(launchResolved && bounded(step.agent, 256) ? { agent: bounded(step.agent, 256) } : {}),
 			...(bounded(step.sessionName, 256) ? { sessionName: bounded(step.sessionName, 256) } : {}),
+			...(bounded(step.sessionFile, MAX_SESSION_FILE_BYTES) ? { sessionFile: step.sessionFile } : {}),
 			...(bounded(step.model, 256) ? { model: bounded(step.model, 256) } : {}),
 			...(bounded(step.thinking, 32) ? { thinking: bounded(step.thinking, 32) } : {}),
 		});
@@ -113,6 +124,7 @@ export function workflowChildSummary(input: {
 			...(bounded(child.runId, 256) ? { runId: bounded(child.runId, 256) } : {}),
 			...(bounded(child.agent, 256) ? { agent: bounded(child.agent, 256) } : {}),
 			...(bounded(result?.sessionName, 256) ? { sessionName: bounded(result?.sessionName, 256) } : {}),
+			...(bounded(result?.sessionFile, MAX_SESSION_FILE_BYTES) ? { sessionFile: result?.sessionFile as string } : {}),
 			...(bounded(result?.model, 256) ? { model: bounded(result?.model, 256) } : {}),
 			...(bounded(result?.thinking, 32) ? { thinking: bounded(result?.thinking, 32) } : {}),
 		});
@@ -124,11 +136,14 @@ export function workflowChildSummary(input: {
 	}
 	for (const [key, launch] of input.launches ?? []) {
 		const row = rows.get(key);
-		if (!row || row.state !== "running") continue;
+		if (!row) continue;
+		const running = row.state === "running";
 		rows.set(key, {
 			...row,
-			...(!row.runId && bounded(launch.runId, 256) ? { runId: launch.runId } : {}),
-			...(!row.agent && bounded(launch.agent, 256) ? { agent: launch.agent } : {}),
+			...(running && !row.runId && bounded(launch.runId, 256) ? { runId: launch.runId } : {}),
+			...(running && !row.agent && bounded(launch.agent, 256) ? { agent: launch.agent } : {}),
+			// Finished rows keep it too: live updates carry no child results, so this is a settled child's only transcript link until the workflow returns.
+			...(!row.sessionFile && bounded(launch.sessionFile, MAX_SESSION_FILE_BYTES) ? { sessionFile: launch.sessionFile } : {}),
 		});
 	}
 	for (const [key, progress] of input.progress ?? []) {
@@ -145,7 +160,7 @@ export function workflowChildSummary(input: {
 	}
 	return {
 		version: 1,
-		parentToolCallId: requiredId(input.parentToolCallId, "parentToolCallId"),
+		parentToolCallId: parentToolCallId(input.parentToolCallId, "parentToolCallId"),
 		workflowRunId: requiredId(input.workflowRunId, "workflowRunId"),
 		inventoryComplete: input.inventoryComplete,
 		workflowState: input.workflowState,
@@ -165,19 +180,19 @@ export function parseWorkflowChildSummary(value: unknown): WorkflowChildSummary 
 	const children = input.children.map((row): WorkflowChildSummary["children"][number] => {
 		if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("workflowChildren child row is invalid.");
 		const child = row as Record<string, unknown>;
-		if (Object.keys(child).some((key) => !["childId", "runId", "agent", "sessionName", "model", "thinking", "state", "activity"].includes(key))) throw new Error("workflowChildren child row has unsupported fields.");
+		if (Object.keys(child).some((key) => !["childId", "runId", "agent", "sessionName", "sessionFile", "model", "thinking", "state", "activity"].includes(key))) throw new Error("workflowChildren child row has unsupported fields.");
 		if (typeof child.childId !== "string" || !KEY_PATTERN.test(child.childId)) throw new Error("workflowChildren childId is invalid.");
 		const state = child.state;
 		if (state !== "pending" && state !== "running" && state !== "completed" && state !== "failed" && state !== "paused" && state !== "stopped" && state !== "rejected" && state !== "detached") throw new Error("workflowChildren child state is invalid.");
-		for (const [field, maxBytes] of [["runId", 256], ["agent", 256], ["sessionName", 256], ["model", 256], ["thinking", 32]] as const) {
+		for (const [field, maxBytes] of [["runId", 256], ["agent", 256], ["sessionName", 256], ["sessionFile", MAX_SESSION_FILE_BYTES], ["model", 256], ["thinking", 32]] as const) {
 			if (child[field] !== undefined && bounded(child[field], maxBytes) === undefined) throw new Error(`workflowChildren child ${field} is invalid.`);
 		}
 		const activity = parseActivity(child.activity);
 		if (activity && state !== "running") throw new Error("workflowChildren child activity requires running state.");
-		return { childId: child.childId, state, ...(activity ? { activity } : {}), ...(child.runId ? { runId: child.runId as string } : {}), ...(child.agent ? { agent: child.agent as string } : {}), ...(child.sessionName ? { sessionName: child.sessionName as string } : {}), ...(child.model ? { model: child.model as string } : {}), ...(child.thinking ? { thinking: child.thinking as string } : {}) };
+		return { childId: child.childId, state, ...(activity ? { activity } : {}), ...(child.runId ? { runId: child.runId as string } : {}), ...(child.agent ? { agent: child.agent as string } : {}), ...(child.sessionName ? { sessionName: child.sessionName as string } : {}), ...(child.sessionFile ? { sessionFile: child.sessionFile as string } : {}), ...(child.model ? { model: child.model as string } : {}), ...(child.thinking ? { thinking: child.thinking as string } : {}) };
 	});
 	if (new Set(children.map((child) => child.childId)).size !== children.length) throw new Error("workflowChildren has duplicate childId values.");
 	if (typeof input.parentToolCallId !== "string") throw new Error("workflowChildren.parentToolCallId is invalid.");
 	if (typeof input.workflowRunId !== "string") throw new Error("workflowChildren.workflowRunId is invalid.");
-	return { version: 1, parentToolCallId: requiredId(input.parentToolCallId, "workflowChildren.parentToolCallId"), workflowRunId: requiredId(input.workflowRunId, "workflowChildren.workflowRunId"), inventoryComplete: input.inventoryComplete, workflowState, children };
+	return { version: 1, parentToolCallId: parentToolCallId(input.parentToolCallId, "workflowChildren.parentToolCallId"), workflowRunId: requiredId(input.workflowRunId, "workflowChildren.workflowRunId"), inventoryComplete: input.inventoryComplete, workflowState, children };
 }

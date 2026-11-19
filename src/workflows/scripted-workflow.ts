@@ -1,10 +1,11 @@
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
-import { Worker } from "node:worker_threads";
+import { createWorkflowScriptWorker } from "./workflow-script-worker.ts";
 import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../runs/shared/parallel-utils.ts";
 import { HOST_STEP_MAX_COUNT } from "../runs/shared/host-step-status.ts";
 import { describeGateAcceptanceConflict, parseGateInput } from "../runs/shared/acceptance.ts";
+import { REQUIRE_LAUNCHER_SHAPE_ERROR } from "../runs/shared/runner-launcher.ts";
 import type { AcceptanceRecoveryMetadata, HostStepNode, SingleResult, WorkflowScriptFailureKind } from "../shared/types.ts";
 import { normalizeWorkflowHostCommandParams, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "./host-command.ts";
 
@@ -18,6 +19,7 @@ function validGitRef(ref: unknown): ref is string {
 }
 const requireFromPackage = createRequire(import.meta.url);
 const WORKFLOW_ASSEMBLY_FLUSH_TIMEOUT_MS = 5_000;
+const WORKFLOW_DRAIN_CHILD_MESSAGE = "Workflow draining; child not started.";
 
 export interface WorkflowScriptValidationError {
 	message: string;
@@ -42,1076 +44,6 @@ export interface WorkflowScriptValidationOptions {
 	/** Returns why launch-time resolution would reject this literal child agent name. */
 	agentNameError?: (name: string) => string | undefined;
 }
-
-const WORKER_SOURCE = String.raw`
-const { parentPort, workerData } = require("node:worker_threads");
-const vm = require("node:vm");
-const { inspect } = require("node:util");
-const { parse } = require(workerData.acornPath);
-
-let promiseHooks;
-try {
-  ({ promiseHooks } = require("node:v8"));
-} catch {}
-
-function createWorkflowPromiseHook(callbacks) {
-  if (!promiseHooks || typeof promiseHooks.createHook !== "function") return () => {};
-  try {
-    return promiseHooks.createHook(callbacks);
-  } catch (error) {
-    if (error?.name !== "NotImplementedError") throw error;
-    return () => {};
-  }
-}
-
-let nextCallId = 0;
-let topLevelWorkflowPromise;
-let suppressNativePromiseConsumption = 0;
-const activeNativePromises = [];
-const pending = new Map();
-const workflowErrorKinds = new WeakMap();
-const runKeyPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-function validGitRef(ref) {
-  if (typeof ref !== "string" || !ref || ref === "@" || new TextEncoder().encode(ref).length > 1024 || ref.startsWith("/") || ref.endsWith("/") || ref.includes("//") || ref.includes("..") || ref.includes("@{")) return false;
-  if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(ref)) return false;
-  if (/[[\]\\~^:?*\u0000-\u0020\u007f]/u.test(ref) || ref.endsWith(".") || ref.endsWith(".lock")) return false;
-  return ref.split("/").every((component) => component.length > 0 && component !== "." && component !== ".." && !component.startsWith(".") && !component.endsWith(".") && !component.endsWith(".lock"));
-}
-const trackedPromiseTrackers = new WeakMap();
-const trackedPromiseTargets = new WeakMap();
-let nativePromiseTrackers = new WeakMap();
-let nativePromiseParents = new WeakMap();
-const observedCallIds = new Set();
-
-function stableRunJson(value) {
-  if (Array.isArray(value)) return "[" + value.map(stableRunJson).join(",") + "]";
-  if (value && typeof value === "object") return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + stableRunJson(value[key])).join(",") + "}";
-  return JSON.stringify(value) ?? "undefined";
-}
-
-function canonicalRunParams(params) {
-  if (params.gate === undefined || params.acceptance !== false) return params;
-  const { acceptance: _acceptance, ...withoutAcceptance } = params;
-  return withoutAcceptance;
-}
-
-function isDirectWorkflowScriptPromiseHandlerCall() {
-  const stack = new Error().stack;
-  if (typeof stack !== "string") return false;
-  return stack.split("\n").some((line) => line.includes("workflow-script.js") && !line.includes("at async "));
-}
-
-function nativePromiseTracker(promise) {
-  if (!promise || (typeof promise !== "object" && typeof promise !== "function")) return undefined;
-  let tracker = nativePromiseTrackers.get(promise);
-  if (!tracker) {
-    tracker = { observations: [], consumed: false, dependencies: [] };
-    nativePromiseTrackers.set(promise, tracker);
-  }
-  return tracker;
-}
-
-function promiseObservationTracker(value) {
-  if (!value || (typeof value !== "object" && typeof value !== "function")) return undefined;
-  return trackedPromiseTrackers.get(value) ?? nativePromiseTrackers.get(value);
-}
-
-function addTrackerDependency(tracker, dependency) {
-  if (!dependency) return;
-  tracker.dependencies ??= [];
-  if (!tracker.dependencies.includes(dependency)) tracker.dependencies.push(dependency);
-  if (tracker.consumed) markTrackedObservationsConsumed(dependency);
-}
-
-function descendsFromTopLevelWorkflow(promise) {
-  const seen = new Set();
-  for (let current = promise; current && !seen.has(current); current = nativePromiseParents.get(current)) {
-    if (current === topLevelWorkflowPromise) return true;
-    seen.add(current);
-  }
-  return false;
-}
-
-function withSuppressedNativePromiseConsumption(callback) {
-  suppressNativePromiseConsumption++;
-  try {
-    return callback();
-  } finally {
-    suppressNativePromiseConsumption--;
-  }
-}
-
-function mergeObservations(...groups) {
-  const seen = new Set();
-  const merged = [];
-  for (const group of groups) {
-    for (const observation of group) {
-      if (!observation || typeof observation.callId !== "number" || typeof observation.key !== "string" || typeof observation.operation !== "string" || seen.has(observation.callId)) continue;
-      seen.add(observation.callId);
-      merged.push(observation);
-    }
-  }
-  return merged;
-}
-
-function trackedObservationTracker(value) {
-  return value && (typeof value === "object" || typeof value === "function") ? trackedPromiseTrackers.get(value) : undefined;
-}
-
-function trackedPromiseTarget(value) {
-  return value && (typeof value === "object" || typeof value === "function") ? trackedPromiseTargets.get(value) ?? value : value;
-}
-
-function addTrackedObservations(tracker, observations) {
-  tracker.observations = mergeObservations(tracker.observations, observations);
-  if (!tracker.consumed) return;
-  for (const observation of tracker.observations) {
-    if (observedCallIds.has(observation.callId)) continue;
-    observedCallIds.add(observation.callId);
-    parentPort.postMessage({ type: "callObserved", callId: observation.callId, key: observation.key, operation: observation.operation });
-  }
-}
-
-function markTrackedObservationsConsumed(tracker, seen = new Set()) {
-  if (seen.has(tracker)) return;
-  seen.add(tracker);
-  tracker.consumed = true;
-  addTrackedObservations(tracker, []);
-  for (const dependency of tracker.dependencies ?? []) markTrackedObservationsConsumed(dependency, seen);
-}
-
-function consumeTrackedObservations(tracker) {
-  if (isDirectWorkflowScriptPromiseHandlerCall()) return;
-  const activePromise = activeNativePromises.at(-1);
-  if (activePromise === topLevelWorkflowPromise || descendsFromTopLevelWorkflow(activePromise)) {
-    markTrackedObservationsConsumed(tracker);
-  } else if (activePromise) {
-    addTrackerDependency(nativePromiseTracker(activePromise), tracker);
-  } else {
-    markTrackedObservationsConsumed(tracker);
-  }
-}
-
-function trackObservationTracker(tracker, promise, allowFutureObservations = false) {
-  const target = trackedPromiseTarget(promise);
-  if ((!allowFutureObservations && tracker.observations.length === 0) || !target || typeof target.then !== "function") return promise;
-
-  const tracked = new Proxy(target, {
-    get(promiseTarget, prop) {
-      if (prop === "then") return function promiseThen(onFulfilled, onRejected) {
-        consumeTrackedObservations(tracker);
-        const chainTracker = { observations: tracker.observations, consumed: false, dependencies: [tracker] };
-        const wrapHandler = (handler) => typeof handler === "function"
-          ? function trackedThenHandler(...args) {
-            const value = handler.apply(this, args);
-            addTrackerDependency(chainTracker, promiseObservationTracker(value));
-            return trackedPromiseTarget(value);
-          }
-          : handler;
-        return trackObservationTracker(chainTracker, promiseTarget.then(wrapHandler(onFulfilled), wrapHandler(onRejected)), true);
-      };
-      if (prop === "catch") return function promiseCatch(onRejected) {
-        consumeTrackedObservations(tracker);
-        return trackObservationTracker({ observations: tracker.observations, consumed: false, dependencies: [tracker] }, promiseTarget.catch(onRejected), true);
-      };
-      if (prop === "finally") return function promiseFinally(onFinally) {
-        consumeTrackedObservations(tracker);
-        return trackObservationTracker({ observations: tracker.observations, consumed: false, dependencies: [tracker] }, promiseTarget.finally(onFinally), true);
-      };
-      return Reflect.get(promiseTarget, prop, promiseTarget);
-    },
-  });
-  trackedPromiseTrackers.set(tracked, tracker);
-  trackedPromiseTargets.set(tracked, target);
-  return tracked;
-}
-
-function trackRunObservation(observations, promise) {
-  const tracker = trackedObservationTracker(promise) ?? { observations: [], consumed: false };
-  addTrackedObservations(tracker, observations);
-  return trackObservationTracker(tracker, promise);
-}
-
-function trackPromiseCombinator(items, createPromise) {
-  const values = Array.from(items);
-  const dependencies = [...new Set(values.map(promiseObservationTracker).filter(Boolean))];
-  const promise = withSuppressedNativePromiseConsumption(() => createPromise(values.map(trackedPromiseTarget)));
-  if (dependencies.length === 0) return promise;
-  return trackObservationTracker({ observations: [], consumed: false, dependencies }, promise, true);
-}
-
-// Hosts that freeze built-ins make Promise.all and friends non-writable and non-configurable, and a
-// Proxy over Promise itself may not return wrappers for those. Proxy a plain constructor instead.
-const workflowPromiseTarget = function Promise() {};
-workflowPromiseTarget.prototype = Promise.prototype;
-const workflowPromise = new Proxy(workflowPromiseTarget, {
-  apply() {
-    throw new TypeError("Promise constructor cannot be invoked without 'new'");
-  },
-  construct(_proxyTarget, [executor]) {
-    const target = Promise;
-    if (typeof executor !== "function") return new target(executor);
-    const tracker = { observations: [], consumed: false };
-    const promise = new target((resolve, reject) => {
-      let settled = false;
-      try {
-        executor((value) => {
-          if (settled) return;
-          settled = true;
-          addTrackerDependency(tracker, promiseObservationTracker(value));
-          resolve(trackedPromiseTarget(value));
-        }, (reason) => {
-          if (settled) return;
-          settled = true;
-          reject(reason);
-        });
-      } catch (error) {
-        settled = true;
-        throw error;
-      }
-    });
-    return trackObservationTracker(tracker, promise, true);
-  },
-  get(_proxyTarget, prop) {
-    const target = Promise;
-    if (prop === "all") return (items) => trackPromiseCombinator(items, (values) => target.all(values));
-    if (prop === "allSettled") return (items) => trackPromiseCombinator(items, (values) => target.allSettled(values));
-    if (prop === "race") return (items) => trackPromiseCombinator(items, (values) => target.race(values));
-    if (prop === "any") return (items) => trackPromiseCombinator(items, (values) => target.any(values));
-    if (prop === "resolve") return (value) => {
-      const dependency = promiseObservationTracker(value);
-      const promise = withSuppressedNativePromiseConsumption(() => target.resolve(trackedPromiseTarget(value)));
-      if (!dependency) return promise;
-      return trackObservationTracker({ observations: [], consumed: false, dependencies: [dependency] }, promise, true);
-    };
-    const value = target[prop];
-    return typeof value === "function" ? value.bind(target) : value;
-  },
-});
-
-function hostCall(method, args, observation) {
-  const callId = ++nextCallId;
-  const promise = new Promise((resolve, reject) => {
-    pending.set(callId, { resolve, reject });
-    parentPort.postMessage({ type: "call", callId, method, args });
-  });
-  return observation && typeof observation.key === "string" && typeof observation.operation === "string"
-    ? trackRunObservation([{ key: observation.key, operation: observation.operation, callId }], promise)
-    : promise;
-}
-
-function runHostCall(key, params, collectFailure, batch, generatedLaneKey) {
-  const callId = ++nextCallId;
-  const promise = new Promise((resolve, reject) => {
-    pending.set(callId, { resolve, reject });
-    parentPort.postMessage({ type: "call", callId, method: "run", args: { key, params, ...(collectFailure ? { collectFailure: true } : {}), ...(batch ? { batch } : {}), ...(generatedLaneKey ? { generatedLaneKey } : {}) } });
-  });
-  return { key, callId, promise };
-}
-
-function isArrayIndexProperty(prop) {
-  if (!/^(0|[1-9]\d*)$/.test(prop)) return false;
-  const index = Number(prop);
-  return Number.isSafeInteger(index) && index >= 0 && index < 4294967295;
-}
-
-const runsAllResultTargets = new WeakMap();
-
-const MAX_LANES = 32;
-const MAX_LANE_STAGES = 16;
-const MAX_LANE_STAGE_COUNT = 64;
-const MAX_LANE_SPEC_BYTES = 64 * 1024;
-const MAX_LANE_TASK_BYTES = 1024 * 1024;
-const MAX_LANE_PATH_BYTES = 32 * 1024;
-const MAX_LANE_BOARD_TEXT_BYTES = 256;
-const LANE_PATH_FIELDS = new Set(["cwd", "output", "sessionDir"]);
-
-function runsAllKeyAccessError(prop) {
-  return new Error("Cannot read runs.all result property '" + prop + "'. runs.all resolves to an ordered array, not a key map. Use results[0], array destructuring, or results.map((result) => result.output), not results." + prop + ".");
-}
-
-function wrapRunsAllResults(results, keys) {
-  const keySet = new Set(keys);
-  const proxy = new Proxy(results, {
-    get(target, prop, receiver) {
-      if (typeof prop !== "string") return Reflect.get(target, prop, receiver);
-      if (prop === "then" || prop === "toJSON") return undefined;
-      if (prop in target || isArrayIndexProperty(prop)) return Reflect.get(target, prop, receiver);
-      if (keySet.has(prop)) throw runsAllKeyAccessError(prop);
-      throw runsAllKeyAccessError(prop);
-    },
-  });
-  runsAllResultTargets.set(proxy, results);
-  return proxy;
-}
-
-function laneByteLength(value) {
-  return new TextEncoder().encode(value).byteLength;
-}
-
-function laneBoardText(value) {
-  if (typeof value !== "string" || !value) return undefined;
-  if (laneByteLength(value) <= MAX_LANE_BOARD_TEXT_BYTES) return value;
-  const bytes = new TextEncoder().encode(value).subarray(0, MAX_LANE_BOARD_TEXT_BYTES - 3);
-  return new TextDecoder().decode(bytes) + "...";
-}
-
-function laneBoardPath(value) {
-  if (typeof value !== "string" || !value || laneByteLength(value) > MAX_LANE_BOARD_TEXT_BYTES) return undefined;
-  return value;
-}
-
-function validateLaneStageBounds(params, label) {
-  if (typeof params.task === "string" && laneByteLength(params.task) > MAX_LANE_TASK_BYTES) throw new Error(label + " task exceeds 1 MiB when UTF-8 encoded.");
-  for (const field of LANE_PATH_FIELDS) if (typeof params[field] === "string" && laneByteLength(params[field]) > MAX_LANE_PATH_BYTES) throw new Error(label + " " + field + " exceeds 32 KiB when UTF-8 encoded.");
-}
-
-function validateLaneKey(value, owner) {
-  if (typeof value !== "string" || !runKeyPattern.test(value)) throw new Error(owner + " key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.");
-  return value;
-}
-
-function laneStageParams(stage, previous) {
-  const resume = stage.resume;
-  const params = { ...stage.params };
-  if (resume !== "previous") return params;
-  if (!previous || typeof previous.runId !== "string" || !previous.runId.trim()) return undefined;
-  return { ...params, resume: previous.runId.trim() };
-}
-
-function laneStageVerdict(result) {
-  const structured = result && typeof result === "object" && !Array.isArray(result) ? result.structuredOutput : undefined;
-  const verdict = structured && typeof structured === "object" && !Array.isArray(structured) ? structured.verdict : undefined;
-  return typeof verdict === "string" && verdict.trim() ? laneBoardText(verdict.trim()) : undefined;
-}
-
-function laneStageIsBlocked(result) {
-  const structured = result && typeof result === "object" && !Array.isArray(result) ? result.structuredOutput : undefined;
-  return structured && typeof structured === "object" && !Array.isArray(structured) && structured.verdict === "blocked";
-}
-
-function laneStageRecord(stageKey, child, forcedState) {
-  const result = child && typeof child === "object" && !Array.isArray(child) ? child : undefined;
-  const ok = result?.ok === true;
-  const verdict = laneStageVerdict(result);
-  const blocked = laneStageIsBlocked(result);
-  const state = forcedState ?? (result?.state === "running" ? "running" : result?.stopped ? "stopped" : result?.detached ? "detached" : ok ? blocked ? "blocked" : "completed" : "failed");
-  const error = state !== "completed" && state !== "running"
-    ? state === "blocked" && blocked
-      ? "Stage returned a blocked verdict."
-      : typeof result?.error === "string"
-        ? result.error
-        : typeof result?.output === "string"
-          ? result.output
-          : "Stage did not complete successfully."
-    : undefined;
-  return {
-    key: stageKey,
-    ...(typeof result?.runId === "string" && result.runId.trim() ? { runId: laneBoardText(result.runId.trim()) } : {}),
-    ...(result ? { ok } : {}),
-    state,
-    ...(typeof result?.outputReference === "string" ? (laneBoardPath(result.outputReference) ? { outputReference: laneBoardPath(result.outputReference) } : {}) : {}),
-    ...(verdict ? { verdict } : {}),
-    ...(error ? { error: laneBoardText(error) } : {}),
-  };
-}
-
-function laneFailure(stageKey, error) {
-  const text = error instanceof Error ? error.message : String(error);
-  return { key: stageKey, ok: false, output: text, error: text, artifactPaths: [] };
-}
-
-function runCollected(key, params, observe, generatedLaneKey) {
-  validateRunCall(key, params, "runs.lanes stage", runFingerprints);
-  const launched = runHostCall(key, params, true, undefined, generatedLaneKey);
-  observe([{ key, operation: "run", callId: launched.callId }]);
-  return launched.promise.then(decorateWorkflowChildResult);
-}
-
-function validateLaneSpecs(laneSpecs) {
-  if (!Array.isArray(laneSpecs)) throw new Error("runs.lanes(lanes) requires an array.");
-  if (laneSpecs.length === 0) throw new Error("runs.lanes(lanes) requires at least one lane.");
-  if (laneSpecs.length > MAX_LANES) throw new Error("runs.lanes supports at most " + MAX_LANES + " lanes.");
-  assertJsonValue(laneSpecs, "runs.lanes lanes");
-  if (laneByteLength(stableRunJson(laneSpecs)) > MAX_LANE_SPEC_BYTES) throw new Error("runs.lanes canonical JSON exceeds 64 KiB.");
-  const generatedKeys = new Set();
-  const validationFingerprints = new Map();
-  let stageCount = 0;
-  const normalized = [];
-  for (let laneIndex = 0; laneIndex < laneSpecs.length; laneIndex++) {
-    const lane = laneSpecs[laneIndex];
-    const laneLabel = "runs.lanes lane " + laneIndex;
-    if (!lane || typeof lane !== "object" || Array.isArray(lane)) throw new Error(laneLabel + " must be an object.");
-    const laneFields = Object.keys(lane);
-    if (laneFields.some((field) => field !== "key" && field !== "stages")) throw new Error(laneLabel + " contains unsupported fields.");
-    const laneKey = validateLaneKey(lane.key, laneLabel);
-    if (!Array.isArray(lane.stages) || lane.stages.length === 0) throw new Error(laneLabel + " stages must contain at least one stage.");
-    if (lane.stages.length > MAX_LANE_STAGES) throw new Error(laneLabel + " supports at most " + MAX_LANE_STAGES + " stages.");
-    const stageKeys = new Set();
-    const stages = [];
-    for (let stageIndex = 0; stageIndex < lane.stages.length; stageIndex++) {
-      stageCount++;
-      if (stageCount > MAX_LANE_STAGE_COUNT) throw new Error("runs.lanes supports at most " + MAX_LANE_STAGE_COUNT + " total stages.");
-      const stage = lane.stages[stageIndex];
-      const stageLabel = laneLabel + " stage " + stageIndex;
-      if (!stage || typeof stage !== "object" || Array.isArray(stage)) throw new Error(stageLabel + " must be an object.");
-      const stageKey = validateLaneKey(stage.key, stageLabel);
-      if (stageKeys.has(stageKey)) throw new Error(laneLabel + " contains duplicate stage key '" + stageKey + "'.");
-      stageKeys.add(stageKey);
-      const generatedKey = laneKey + "." + stageKey;
-      validateLaneKey(generatedKey, stageLabel + " generated");
-      if (generatedKeys.has(generatedKey)) throw new Error("runs.lanes generated child key '" + generatedKey + "' is duplicated.");
-      generatedKeys.add(generatedKey);
-      const resume = stage.resume;
-      if (resume !== undefined && resume !== "previous") {
-        if (stageIndex === 0 && typeof resume === "string") {
-          throw new Error(stageLabel + " cannot resume a retained run id in runs.lanes; use runs.run(key, { resume: id }) outside lanes, or start the lane with an agent stage and use resume: \"previous\" later.");
-        }
-        throw new Error(stageLabel + " resume must be 'previous'.");
-      }
-      if (stageIndex === 0 && resume === "previous") throw new Error(stageLabel + " cannot resume previous without a predecessor stage.");
-      const { key: _stageKey, resume: _resume, ...params } = stage;
-      const validationParams = resume === "previous" ? { ...params, resume: "retained-run-placeholder" } : params;
-      validateLaneStageBounds(validationParams, stageLabel);
-      validateRunCall(generatedKey, validationParams, stageLabel, validationFingerprints);
-      const existingFingerprint = runFingerprints.get(generatedKey);
-      if (existingFingerprint !== undefined && (resume === "previous" || existingFingerprint !== stableRunJson(canonicalRunParams(params)))) {
-        throw new Error("runs.lanes generated child key '" + generatedKey + "' is already used with incompatible launch params.");
-      }
-      stages.push({ key: stageKey, generatedKey, resume, params });
-    }
-    normalized.push({ key: laneKey, stages });
-  }
-  return normalized;
-}
-
-function runLane(lane, firstResult, observe) {
-  const records = [];
-  const appendSkipped = (start) => {
-    for (let index = start; index < lane.stages.length; index++) records.push({ key: lane.stages[index].key, state: "skipped" });
-  };
-  const finish = (state, failedStage) => ({ key: lane.key, state, ...(failedStage ? { failedStage } : {}), stages: records });
-  const visit = (index, previous) => {
-    if (index >= lane.stages.length) return Promise.resolve(finish("complete"));
-    const stage = lane.stages[index];
-    if (index === 0) {
-      const record = laneStageRecord(stage.key, previous);
-      records.push(record);
-      if (record.state !== "completed") {
-        appendSkipped(index + 1);
-        return Promise.resolve(finish("blocked", stage.key));
-      }
-      return visit(index + 1, previous);
-    }
-    if (stage.resume === "previous" && (!previous || typeof previous.runId !== "string" || !previous.runId.trim())) {
-      records.push({ key: stage.key, state: "blocked", error: "Previous stage did not return a retained run id." });
-      appendSkipped(index + 1);
-      return Promise.resolve(finish("blocked", stage.key));
-    }
-    if (!previous || previous.ok !== true || laneStageIsBlocked(previous)) {
-      records.push({ key: stage.key, state: "blocked", error: "Previous stage did not complete successfully." });
-      appendSkipped(index + 1);
-      return Promise.resolve(finish("blocked", stage.key));
-    }
-    const params = laneStageParams(stage, previous);
-    if (!params) {
-      records.push({ key: stage.key, state: "blocked", error: "Previous stage did not return a retained run id." });
-      appendSkipped(index + 1);
-      return Promise.resolve(finish("blocked", stage.key));
-    }
-    let launched;
-    try {
-      launched = runCollected(stage.generatedKey, params, observe, lane.key);
-    } catch (error) {
-      const failed = laneFailure(stage.generatedKey, error);
-      records.push(laneStageRecord(stage.key, failed));
-      appendSkipped(index + 1);
-      return Promise.resolve(finish("blocked", stage.key));
-    }
-    return launched.then((result) => {
-      const record = laneStageRecord(stage.key, result);
-      records.push(record);
-      if (record.state === "completed") return visit(index + 1, result);
-      appendSkipped(index + 1);
-      return finish("blocked", stage.key);
-    }, (error) => {
-      const failed = laneFailure(stage.generatedKey, error);
-      records.push(laneStageRecord(stage.key, failed));
-      appendSkipped(index + 1);
-      return finish("blocked", stage.key);
-    });
-  };
-  return visit(0, firstResult);
-}
-
-function workflowPlanStringMetadata(params) {
-  return {
-    ...(typeof params.phase === "string" && params.phase.trim() ? { phase: params.phase.trim() } : {}),
-    ...(typeof params.label === "string" && params.label.trim() ? { label: params.label.trim() } : {}),
-    ...(typeof params.agent === "string" && params.agent.trim() ? { agent: params.agent.trim() } : {}),
-  };
-}
-
-function runLanes(laneSpecs) {
-  const lanes = validateLaneSpecs(laneSpecs);
-  parentPort.postMessage({ type: "lanePlan", lanes: lanes.map((lane) => ({
-    key: lane.key,
-    stages: lane.stages.map((stage) => ({
-      key: stage.key,
-      generatedKey: stage.generatedKey,
-      ...workflowPlanStringMetadata(stage.params),
-      ...(typeof stage.params.as === "string" && stage.params.as.trim() ? { outputName: stage.params.as.trim() } : {}),
-      ...(stage.params.outputSchema ? { structured: true } : {}),
-    })),
-  })) });
-  const firstItems = lanes.map((lane) => {
-    const first = lane.stages[0];
-    return { key: first.generatedKey, ...first.params };
-  });
-  // Share the runs.all batch launcher while allowing each lane to advance independently.
-  const firstBatch = launchRunsAll(firstItems, lanes.map((lane) => lane.key));
-  const firstResults = firstBatch.launched.map(({ promise }) => promise.then(decorateWorkflowChildResult));
-  let trackedAggregate;
-  const observe = (observations) => trackRunObservation(observations, trackedAggregate);
-  const laneAggregate = Promise.all(lanes.map((lane, index) => firstResults[index].then(
-    (result) => runLane(lane, result, observe),
-    (error) => runLane(lane, laneFailure(lane.stages[0].generatedKey, error), observe),
-  )));
-  trackedAggregate = trackRunObservation(firstBatch.launched.map(({ key, callId }) => ({ key, operation: "run", callId })), laneAggregate);
-  return trackedAggregate;
-}
-
-function formatRef(result) {
-  if (!result || typeof result !== "object") throw new Error("runs.ref(result) requires a run result object.");
-  const parts = ["run " + (result.key || "unknown")];
-  if (result.runId) parts.push("id=" + String(result.runId).slice(0, 8));
-  return "[" + parts.join("; ") + "]";
-}
-
-function formatChildResultString(result) {
-  const output = typeof result?.output === "string" ? result.output.trim() : "";
-  return output || formatRef(result);
-}
-
-function decorateWorkflowChildResult(result) {
-  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
-  Object.defineProperties(result, {
-    toString: { value() { return formatChildResultString(this); }, enumerable: false, configurable: true },
-  });
-  return result;
-}
-
-let runFingerprints = new Map();
-
-function validateExtensionBindings(value, label) {
-  if (value === undefined) return;
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(label + " extensionBindings must be a plain JSON object.");
-  const keys = Object.keys(value);
-  if (keys.length > 16) throw new Error(label + " extensionBindings supports at most 16 namespaces.");
-  for (const key of keys) if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62})\/[1-9][0-9]{0,8}$/.test(key)) throw new Error(label + " extensionBindings namespace '" + key + "' must use a package-like name followed by '/<positive-version>'.");
-  assertJsonValue(value, label + " extensionBindings");
-  let propertyCount = 0;
-  function visit(entry, depth) {
-    if (!entry || typeof entry !== "object") return;
-    if (depth > 16) throw new Error(label + " extensionBindings exceeds the maximum nesting depth of 16.");
-    if (Array.isArray(entry)) { for (const item of entry) visit(item, depth + 1); return; }
-    for (const child of Object.values(entry)) {
-      propertyCount++;
-      if (propertyCount > 256) throw new Error(label + " extensionBindings exceeds 256 total properties.");
-      visit(child, depth + 1);
-    }
-  }
-  visit(value, 0);
-  if (new TextEncoder().encode(stableRunJson(value)).byteLength > 16384) throw new Error(label + " extensionBindings canonical JSON exceeds 16384 bytes.");
-}
-
-function validateLaneMetadata(value, label, workflowKey) {
-  if (value === undefined) return;
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(label + " must be a plain JSON object.");
-  const fields = Object.keys(value);
-  const allowed = ["version", "key", "mode", "sourceRef", "claims", "outputPaths"];
-  const unknown = fields.filter((field) => !allowed.includes(field));
-  if (unknown.length > 0) throw new Error(label + " has unsupported fields: " + unknown.join(", ") + ".");
-  if (value.version !== 1) throw new Error(label + ".version must be 1.");
-  if (typeof value.key !== "string" || !value.key.trim() || !runKeyPattern.test(value.key.trim())) throw new Error(label + ".key is invalid.");
-  if (workflowKey !== undefined && value.key.trim() !== workflowKey) throw new Error(label + ".key must match workflow key '" + workflowKey + "'.");
-  if (value.mode !== undefined && !["mutation", "review", "scout", "gate"].includes(value.mode)) throw new Error(label + ".mode is invalid.");
-  const bounded = (entry, maxBytes) => typeof entry === "string" && entry.trim() && new TextEncoder().encode(entry.trim()).byteLength <= maxBytes && !/[\r\n\u0000]/.test(entry);
-  if (value.sourceRef !== undefined && !bounded(value.sourceRef, 128)) throw new Error(label + ".sourceRef is invalid.");
-  for (const [name, maxItems, maxLength] of [["claims", 20, 160], ["outputPaths", 10, 256]]) {
-    if (value[name] === undefined) continue;
-    if (!Array.isArray(value[name]) || value[name].length > maxItems || value[name].some((entry) => !bounded(entry, maxLength))) throw new Error(label + "." + name + " is invalid.");
-  }
-}
-
-// Mirrors parseGateInput in src/runs/shared/acceptance.ts; the sandbox cannot import it.
-function describeGateShapeError(gate) {
-  const shape = "gate must be a non-empty command string or { command, output?: \"json\", schema?, timeoutMs? }.";
-  if (typeof gate === "string") return gate.trim() ? undefined : shape;
-  if (!gate || typeof gate !== "object" || Array.isArray(gate)) return shape;
-  for (const key of Object.keys(gate)) {
-    if (!["command", "output", "schema", "timeoutMs"].includes(key)) return "gate." + key + " is not supported.";
-  }
-  if (typeof gate.command !== "string" || !gate.command.trim()) return shape;
-  if (gate.output !== undefined && gate.output !== "json") return "gate.output must be \"json\" when present.";
-  if (gate.schema !== undefined) {
-    if (gate.output !== "json") return "gate.schema requires gate.output: \"json\".";
-    if (!gate.schema || typeof gate.schema !== "object" || Array.isArray(gate.schema)) return "gate.schema must be a JSON Schema object.";
-  }
-  if (gate.timeoutMs !== undefined && (!Number.isInteger(gate.timeoutMs) || gate.timeoutMs < 1)) return "gate.timeoutMs must be an integer >= 1.";
-  return undefined;
-}
-
-function describeGateAcceptanceConflict(gate, acceptance) {
-  const render = (value) => {
-    let encoded;
-    try {
-      encoded = JSON.stringify(value) ?? String(value);
-    } catch {
-      encoded = String(value);
-    }
-    return encoded.length > 120 ? encoded.slice(0, 120) + "..." : encoded;
-  };
-  return " Both fields were present: gate=" + render(gate) + " acceptance=" + render(acceptance) + ".";
-}
-
-function validateRunCall(key, params, label, fingerprints) {
-  if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error(label + " has an invalid key.");
-  if (hostKeys.has(key)) throw new Error("Workflow key '" + key + "' is already used by runs.host.");
-  if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error(label + " requires a params object.");
-  if (Object.prototype.hasOwnProperty.call(params, "action") || Object.prototype.hasOwnProperty.call(params, "workflowScript") || Object.prototype.hasOwnProperty.call(params, "globalConcurrencyLimit") || Object.prototype.hasOwnProperty.call(params, "maxSubagentSpawnsPerRun") || Object.prototype.hasOwnProperty.call(params, "tasks") || Object.prototype.hasOwnProperty.call(params, "chain") || Object.prototype.hasOwnProperty.call(params, "parallel") || Object.prototype.hasOwnProperty.call(params, "concurrency") || Object.prototype.hasOwnProperty.call(params, "chainDir")) {
-    const hint = label === "runs.run" ? "; use runs.all(...) and JavaScript control flow for orchestration." : ".";
-    throw new Error(label + " accepts one child via { agent, task } and execution controls only" + hint);
-  }
-  if (Object.prototype.hasOwnProperty.call(params, "clarify")) throw new Error(label + " does not support clarify UI.");
-  if (params.worktree !== undefined && typeof params.worktree !== "boolean") throw new Error(label + " worktree must be true or false.");
-  if (params.baseRef !== undefined && (typeof params.baseRef !== "string" || !validGitRef(params.baseRef))) throw new Error(label + " baseRef must be a valid Git ref: use HEAD or a supported named ref (for example, refs/heads/main). Full 40/64-character commit IDs and revision expressions are unsupported.");
-  validateLaneMetadata(params.lane, label + " lane", key);
-  if (params.gate !== undefined) {
-    const gateError = describeGateShapeError(params.gate);
-    if (gateError) throw new Error(label + " " + gateError);
-  }
-  if (params.gate !== undefined && params.acceptance !== undefined && params.acceptance !== false) throw new Error(label + " gate cannot be combined with acceptance; use one gate command or acceptance.verify." + describeGateAcceptanceConflict(params.gate, params.acceptance));
-  if (params.gate !== undefined && params.resume !== undefined) throw new Error(label + " gate is not supported with retained resume.");
-  if (params.extensionBindings !== undefined && params.resume !== undefined) throw new Error(label + " extensionBindings is not supported with retained resume; resume uses the original retained child binding.");
-  if (params.resume !== undefined && typeof params.resume !== "string") {
-    const reference = params.resume;
-    if (!reference || typeof reference !== "object" || Array.isArray(reference)) throw new Error(label + " resume must be a retained run id or keyed workflow receipt reference.");
-    const fields = Object.keys(reference);
-    if (fields.some((field) => field !== "workflowRunId" && field !== "key" && field !== "latest")) throw new Error(label + " keyed resume contains unsupported fields.");
-    if (typeof reference.workflowRunId !== "string" || !reference.workflowRunId.trim()) throw new Error(label + " keyed resume workflowRunId must be non-empty.");
-    if (typeof reference.key !== "string" || !runKeyPattern.test(reference.key)) throw new Error(label + " keyed resume key is invalid.");
-    if (reference.latest !== true) throw new Error(label + " keyed resume requires latest: true.");
-  }
-  if (typeof params.resume === "string" && !params.resume.trim()) throw new Error(label + " resume must be a non-empty retained run id.");
-  if (params.resume !== undefined && params.agent !== undefined) throw new Error(label + " resume and agent are mutually exclusive.");
-  if (params.resume !== undefined && (typeof params.task !== "string" || !params.task.trim())) throw new Error(label + " resume requires a non-empty task follow-up.");
-  validateExtensionBindings(params.extensionBindings, label);
-  assertJsonValue(params, label + " params");
-  const fingerprint = stableRunJson(canonicalRunParams(params));
-  const existing = fingerprints.get(key);
-  if (existing !== undefined && existing !== fingerprint) throw new Error("Duplicate workflow key '" + key + "' used with incompatible launch params.");
-  fingerprints.set(key, fingerprint);
-}
-
-const hostKeys = new Set();
-
-function validateHostCommand(key, params) {
-  validateLaneKey(key, "runs.host");
-  if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("runs.host('" + key + "') params must be an object.");
-  const allowed = new Set(["kind", "command", "timeoutMs", "output", "role", "provider"]);
-  const unknown = Object.keys(params).filter((field) => !allowed.has(field));
-  if (unknown.length) {
-    const cwdHint = unknown.includes("cwd")
-      ? " The host step does not accept per-step cwd; commands and relative output paths use the workflow cwd. Set cwd on the outer subagent request, or put a trusted directory change in command (for example, 'cd /path/to/worktree && npm test')."
-      : "";
-    throw new Error("runs.host('" + key + "') params have unsupported fields: " + unknown.join(", ") + "." + cwdHint);
-  }
-  if (params.kind !== "command") throw new Error("runs.host('" + key + "') kind must be 'command'.");
-  if (typeof params.command !== "string" || !params.command.trim() || params.command.includes("\u0000") || new TextEncoder().encode(params.command.trim()).byteLength > 16384) throw new Error("runs.host('" + key + "') command must be a non-empty string of at most 16384 bytes without NUL.");
-  if (!Number.isInteger(params.timeoutMs) || params.timeoutMs < 1 || params.timeoutMs > 86400000) throw new Error("runs.host('" + key + "') timeoutMs must be an integer from 1 to 86400000.");
-  if (params.output !== undefined && (typeof params.output !== "string" || !params.output.trim() || /^[/\\]|(?:^|[/\\])\.\.(?:[/\\]|$)/.test(params.output) || /[\u0000-\u001f\u007f]/.test(params.output) || new TextEncoder().encode(params.output.trim()).byteLength > 240)) throw new Error("runs.host('" + key + "') output must be a bounded relative path without traversal or control characters.");
-  if (params.role !== undefined && params.role !== "ci" && params.role !== "gate") throw new Error("runs.host('" + key + "') role must be 'ci' or 'gate'.");
-  if (params.provider !== undefined && (typeof params.provider !== "string" || !params.provider.trim() || /[\r\n\u0000]/.test(params.provider) || new TextEncoder().encode(params.provider.trim()).byteLength > 64)) throw new Error("runs.host('" + key + "') provider must be a non-empty single-line string of at most 64 bytes.");
-  assertJsonValue(params, "runs.host('" + key + "') params");
-  if (hostKeys.has(key) || runFingerprints.has(key)) throw new Error("Workflow key '" + key + "' is already in use.");
-  if (hostKeys.size >= 32) throw new Error("workflowScript supports at most 32 runs.host calls.");
-  hostKeys.add(key);
-}
-
-const RUNS_ALL_PERMISSIVE_WARNING = "runs.all received runs.run(...) launch promise(s) or thenable(s). Those children were already launched individually, so runs.all cannot apply batch fingerprint validation, batch grouping in the fleet view, or collectFailure semantics; a failed child will throw at the runs.all boundary instead of returning as { ok: false }. To get full runs.all semantics, pass config objects: runs.all(items.map((item) => ({ key: item.key, agent: item.agent, task: item.task }))).";
-
-function runsAllItemThenableInfo(item, index) {
-  if (!item || typeof item !== "object" || Array.isArray(item)) return null;
-  if (typeof item.then !== "function") return null;
-  const tracker = promiseObservationTracker(item);
-  const observation = tracker && Array.isArray(tracker.observations) ? tracker.observations.find((entry) => entry && entry.operation === "run") : undefined;
-  return {
-    key: observation && typeof observation.key === "string" ? observation.key : ("runs.all[" + index + "]"),
-    callId: observation && typeof observation.callId === "number" ? observation.callId : null,
-    promise: item,
-  };
-}
-
-let warnedPermissiveRunsAll = false;
-
-function launchRunsAll(items, generatedLaneKeys) {
-  if (!Array.isArray(items)) throw new Error("runs.all(items) requires an array.");
-  const anyThenable = items.some((item, index) => runsAllItemThenableInfo(item, index) !== null);
-  if (anyThenable) return launchRunsAllPermissive(items);
-  const fingerprints = new Map(runFingerprints);
-  const calls = [];
-  for (let index = 0; index < items.length; index++) {
-    if (!Object.prototype.hasOwnProperty.call(items, index)) throw new Error("runs.all items must not contain sparse entries.");
-    const item = items[index];
-    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("runs.all item " + index + " must be an object.");
-    const { key, ...params } = item;
-    validateRunCall(key, params, "runs.all item " + index, fingerprints);
-    calls.push({ key, params });
-  }
-  runFingerprints = fingerprints;
-  const batch = { id: "batch-" + (++nextCallId), calls };
-  const launched = calls.map(({ key, params }, index) => runHostCall(key, params, true, batch, generatedLaneKeys?.[index]));
-  return { calls, launched };
-}
-
-function launchRunsAllPermissive(items) {
-  if (!warnedPermissiveRunsAll) {
-    warnedPermissiveRunsAll = true;
-    try { capturedConsole.warn(RUNS_ALL_PERMISSIVE_WARNING); } catch { /* console emission is best-effort */ }
-  }
-  const fingerprints = new Map(runFingerprints);
-  const calls = [];
-  const launched = [];
-  for (let index = 0; index < items.length; index++) {
-    if (!Object.prototype.hasOwnProperty.call(items, index)) throw new Error("runs.all items must not contain sparse entries.");
-    const item = items[index];
-    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("runs.all item " + index + " must be an object or a runs.run(...) launch promise.");
-    const thenable = runsAllItemThenableInfo(item, index);
-    if (thenable) {
-      calls.push({ key: thenable.key, params: {} });
-      launched.push(thenable);
-      continue;
-    }
-    const { key, ...params } = item;
-    validateRunCall(key, params, "runs.all item " + index, fingerprints);
-    calls.push({ key, params });
-    launched.push(null);
-  }
-  runFingerprints = fingerprints;
-  return { calls, launched: launched.map((entry, index) => entry ?? runHostCall(calls[index].key, calls[index].params, false, undefined)) };
-}
-
-const runs = Object.freeze({
-  run(key, params) {
-    validateRunCall(key, params, "runs.run", runFingerprints);
-    const launched = runHostCall(key, params, false);
-    return trackRunObservation([{ key, operation: "run", callId: launched.callId }], launched.promise.then(decorateWorkflowChildResult));
-  },
-  all(items) {
-    const { calls, launched } = launchRunsAll(items);
-    return trackRunObservation(launched.map(({ key, callId }) => ({ key, operation: "run", callId })), trackPromiseCombinator(launched.map(({ promise }) => promise), (values) => Promise.all(values).then((results) => wrapRunsAllResults(results.map(decorateWorkflowChildResult), calls.map(({ key }) => key)))));
-  },
-  lanes(laneSpecs) {
-    return runLanes(laneSpecs);
-  },
-  host(key, params) {
-    validateHostCommand(key, params);
-    return hostCall("host", { key, params }, { key, operation: "host" });
-  },
-  steer(key, message, options = {}) {
-    if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error("runs.steer has an invalid key.");
-    if (typeof message !== "string" || !message.trim()) throw new Error("runs.steer message must be a non-empty string.");
-    if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("runs.steer options must be an object.");
-    const allowed = new Set(["mode", "index", "ackTimeoutMs"]);
-    for (const option of Object.keys(options)) if (!allowed.has(option)) throw new Error("runs.steer options contain unsupported field '" + option + "'.");
-    if (options.mode !== undefined && options.mode !== "steer" && options.mode !== "follow_up" && options.mode !== "auto") throw new Error("runs.steer mode must be 'steer', 'follow_up', or 'auto'.");
-    if (options.index !== undefined && (!Number.isInteger(options.index) || options.index < 0 || options.index > 1000000)) throw new Error("runs.steer index must be an integer between 0 and 1000000.");
-    if (options.ackTimeoutMs !== undefined && (!Number.isInteger(options.ackTimeoutMs) || options.ackTimeoutMs < 1)) throw new Error("runs.steer ackTimeoutMs must be a positive integer.");
-    return hostCall("steer", { key, message: message.trim(), options }, { key, operation: "steer" });
-  },
-  status(keyOrRunId) { return hostCall("status", { keyOrRunId }); },
-  ref: formatRef,
-  refs(results) {
-    if (!Array.isArray(results)) throw new Error("runs.refs(results) requires an array.");
-    return results.map(formatRef).join("\n");
-  },
-});
-
-function validateStateKey(key) {
-  if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error("state key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.");
-  return key;
-}
-
-const state = Object.freeze({
-  get(key) { return hostCall("state.get", { key: validateStateKey(key) }); },
-  set(key, value) {
-    const validKey = validateStateKey(key);
-    assertJsonValue(value, "state.set('" + validKey + "') value");
-    return hostCall("state.set", { key: validKey, value });
-  },
-});
-
-let contextObjectPrototype;
-
-const capturedConsole = Object.freeze(Object.fromEntries(
-  ["log", "info", "warn", "error"].map((level) => [level, (...args) => {
-    parentPort.postMessage({ type: "console", level, text: args.map((value) => typeof value === "string" ? value : inspect(value, { depth: 4, breakLength: 120 })).join(" ") });
-  }]),
-));
-
-function formatWorkflowScriptSyntaxError(error) {
-  const details = formatWorkflowScriptError(error);
-  return [
-    "workflowScript must be valid JavaScript.",
-    "If task text contains Markdown fences or backticks, use an array joined with \"\\n\" or escaped strings instead of a raw backtick template literal.",
-    "",
-    "Original SyntaxError:",
-    details,
-  ].join("\n");
-}
-
-function formatWorkflowScriptError(error) {
-  const message = error && typeof error.message === "string" ? error.message : String(error);
-  const stack = error && typeof error.stack === "string" ? error.stack : "";
-  if (!stack) return message;
-  return stack.includes(message) ? stack : message + "\n" + stack;
-}
-
-function isSyntaxError(error) {
-  return error instanceof SyntaxError || error?.name === "SyntaxError";
-}
-
-function postWorkflowError(error) {
-  // Pre-run syntax and portability errors are tagged "validation" where the script is compiled;
-  // anything reaching here was thrown while the script ran, including a runtime SyntaxError.
-  const taggedKind = error && (typeof error === "object" || typeof error === "function") ? workflowErrorKinds.get(error) : undefined;
-  parentPort.postMessage({ type: "error", error: isSyntaxError(error) ? formatWorkflowScriptSyntaxError(error) : formatWorkflowScriptError(error), errorKind: taggedKind ?? "script" });
-}
-
-process.on("unhandledRejection", postWorkflowError);
-
-const NESTED_ASYNC_WORKFLOW_ERROR = "workflowScript validation failed before child launch; no children launched. workflowScript does not support nested async functions. Use top-level await, plain helper functions that return runs.run(...), or explicit Promise chains so workflows stay portable across Node and Bun. Parallel plus sequential rewrite: const a = runs.run(\"a\", { agent: \"worker\", task: \"A\" }); const writer = await runs.run(\"writer\", { agent: \"worker\", task: \"Write\" }); const review = await runs.run(\"review\", { agent: \"reviewer\", task: writer.output }); const [aResult] = await Promise.all([a]); return { a: aResult.output, issue: { writerRunId: writer.runId, reviewRunId: review.runId } };";
-const AST_SCALAR_KEYS = new Set(["type", "start", "end"]);
-
-function assertPortableWorkflowScript(source) {
-  const wrapped = "(async () => {\n" + source + "\n})()";
-  let ast;
-  try {
-    ast = parse(wrapped, { ecmaVersion: "latest", sourceType: "script" });
-  } catch (error) {
-    // The wrapper adds one line before the script; report the script's own line.
-    if (isSyntaxError(error) && typeof error.message === "string") {
-      const message = error.message.replace(/\((\d+):(\d+)\)$/, (_match, line, column) => "(" + Math.max(1, Number(line) - 1) + ":" + column + ")");
-      if (typeof error.stack === "string") error.stack = error.stack.replace(error.message, message);
-      error.message = message;
-    }
-    throw error;
-  }
-  const wrapper = workflowWrapperFunction(ast);
-  walkWorkflowAst(wrapper.body, wrapper);
-}
-
-function workflowWrapperFunction(ast) {
-  const wrapper = ast.body?.[0]?.expression?.callee;
-  if (!wrapper || wrapper.type !== "ArrowFunctionExpression") throw new Error("workflowScript wrapper parse invariant failed.");
-  return wrapper;
-}
-
-function isAsyncFunctionNode(node) {
-  return node.async === true && (node.type === "FunctionDeclaration" || node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression");
-}
-
-function walkWorkflowAst(node, allowedAsyncFunction) {
-  if (!node || typeof node !== "object") return;
-  if (Array.isArray(node)) {
-    for (const item of node) walkWorkflowAst(item, allowedAsyncFunction);
-    return;
-  }
-  if (node !== allowedAsyncFunction && isAsyncFunctionNode(node)) {
-    throw new Error(NESTED_ASYNC_WORKFLOW_ERROR);
-  }
-  for (const [key, child] of Object.entries(node)) {
-    if (AST_SCALAR_KEYS.has(key)) continue;
-    walkWorkflowAst(child, allowedAsyncFunction);
-  }
-}
-
-function assertJsonValue(value, path = "emit", seen = new Set()) {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return;
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error(path + " must contain only finite JSON numbers.");
-    return;
-  }
-  if (typeof value !== "object") throw new Error(path + " must be a JSON value; received " + typeof value + ".");
-  if (seen.has(value)) throw new Error(path + " must not contain cycles.");
-  seen.add(value);
-  if (Array.isArray(value)) {
-    for (let index = 0; index < value.length; index++) {
-      if (!Object.prototype.hasOwnProperty.call(value, index)) throw new Error(path + " must not contain sparse array entries.");
-      assertJsonValue(value[index], path + "[" + index + "]", seen);
-    }
-  } else {
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== null && prototype !== Object.prototype && prototype !== contextObjectPrototype) throw new Error(path + " must contain only plain JSON objects.");
-    if (Object.getOwnPropertySymbols(value).length > 0) throw new Error(path + " must not contain symbol keys.");
-    for (const [key, entry] of Object.entries(value)) assertJsonValue(entry, path + "." + key, seen);
-  }
-  seen.delete(value);
-}
-
-function isPlainWorkflowObject(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === null || prototype === Object.prototype || prototype === contextObjectPrototype;
-}
-
-function unwrapRunsAllResults(value, seen = new Map()) {
-  if (value === null || typeof value !== "object") return value;
-  const runsAllTarget = runsAllResultTargets.get(value);
-  const target = runsAllTarget || value;
-  if (seen.has(target)) return seen.get(target);
-  if (Array.isArray(target)) {
-    const copy = [];
-    seen.set(target, copy);
-    let changed = !!runsAllTarget;
-    for (let index = 0; index < target.length; index++) {
-      copy[index] = unwrapRunsAllResults(target[index], seen);
-      changed ||= copy[index] !== target[index];
-    }
-    return changed ? copy : target;
-  }
-  if (!isPlainWorkflowObject(target) || Object.getOwnPropertySymbols(target).length > 0) return target;
-  let changed = false;
-  const entries = Object.entries(target).map(([key, entry]) => {
-    const unwrapped = unwrapRunsAllResults(entry, seen);
-    changed ||= unwrapped !== entry;
-    return [key, unwrapped];
-  });
-  return changed ? Object.fromEntries(entries) : target;
-}
-
-function omitUndefinedWorkflowValues(value, seen = new Set()) {
-  if (value === null || typeof value !== "object") return value;
-  if (seen.has(value)) return value;
-  seen.add(value);
-  const normalized = Array.isArray(value)
-    ? value.map((entry) => entry === undefined ? null : omitUndefinedWorkflowValues(entry, seen))
-    : isPlainWorkflowObject(value) && Object.getOwnPropertySymbols(value).length === 0
-      ? Object.fromEntries(Object.entries(value).flatMap(([key, entry]) => entry === undefined ? [] : [[key, omitUndefinedWorkflowValues(entry, seen)]]))
-      : value;
-  seen.delete(value);
-  return normalized;
-}
-
-function deepFreezeWorkflowArgs(value) {
-  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
-  for (const entry of Object.values(value)) deepFreezeWorkflowArgs(entry);
-  return Object.freeze(value);
-}
-
-parentPort.on("message", async (message) => {
-  if (message.type === "response") {
-    const entry = pending.get(message.callId);
-    if (!entry) return;
-    pending.delete(message.callId);
-    if (message.ok) entry.resolve(message.value);
-    else {
-      const error = new Error(message.error);
-      if (message.errorKind === "child" || message.errorKind === "detached-child") workflowErrorKinds.set(error, message.errorKind);
-      entry.reject(error);
-    }
-    return;
-  }
-  if (message.type !== "start") return;
-  try {
-    const sandbox = { runs, Promise: workflowPromise, emit(value) { const unwrapped = unwrapRunsAllResults(value); const emittedValue = unwrapped === undefined ? null : omitUndefinedWorkflowValues(unwrapped); assertJsonValue(emittedValue); parentPort.postMessage({ type: "emit", value: emittedValue }); }, console: capturedConsole };
-    if (message.stateEnabled) sandbox.state = state;
-    const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
-    contextObjectPrototype = vm.runInContext("Object.prototype", context);
-    // Rebuild args inside the VM realm: a worker-realm object would expose the worker's unrestricted
-    // Function through args.constructor.constructor, bypassing codeGeneration.strings: false.
-    sandbox.args = deepFreezeWorkflowArgs(vm.runInContext("JSON.parse", context)(JSON.stringify(message.args ?? {})));
-    let compiled;
-    try {
-      assertPortableWorkflowScript(message.script);
-      compiled = new vm.Script("(async () => {\n" + message.script + "\n})()", { filename: "workflow-script.js", lineOffset: -1 });
-    } catch (error) {
-      parentPort.postMessage({ type: "error", errorKind: "validation", error: isSyntaxError(error) ? formatWorkflowScriptSyntaxError(error) : formatWorkflowScriptError(error) });
-      return;
-    }
-    const nativePromisePrototype = vm.runInContext("(async () => {})().constructor.prototype", context);
-    const nativeThenDescriptor = Object.getOwnPropertyDescriptor(nativePromisePrototype, "then");
-    if (!nativeThenDescriptor || typeof nativeThenDescriptor.value !== "function") throw new Error("workflowScript could not inspect the VM Promise.prototype.then method.");
-    const nativeThen = nativeThenDescriptor.value;
-    let stopWorkflowPromiseHook;
-    let value;
-    try {
-      // Some hosts freeze built-ins in every realm, which makes then read-only. The promise hooks
-      // below still track observation, so skip the wrapper rather than fail every workflow.
-      if (nativeThenDescriptor.configurable) Object.defineProperty(nativePromisePrototype, "then", {
-        ...nativeThenDescriptor,
-        value: function workflowPromiseThen(...args) {
-          if (isDirectWorkflowScriptPromiseHandlerCall() || suppressNativePromiseConsumption > 0) {
-            return withSuppressedNativePromiseConsumption(() => Reflect.apply(nativeThen, this, args));
-          }
-          return Reflect.apply(nativeThen, this, args);
-        },
-      });
-      stopWorkflowPromiseHook = createWorkflowPromiseHook({
-        before(promise) {
-          activeNativePromises.push(promise);
-        },
-        after(promise) {
-          const index = activeNativePromises.lastIndexOf(promise);
-          if (index !== -1) activeNativePromises.splice(index, 1);
-        },
-        init(promise, parent) {
-          const childTracker = nativePromiseTracker(promise);
-          if (!parent) return;
-          nativePromiseParents.set(promise, parent);
-          const parentTracker = nativePromiseTracker(parent);
-          addTrackerDependency(childTracker, parentTracker);
-          const activePromise = activeNativePromises.at(-1);
-          if (activePromise && activePromise !== parent) {
-            addTrackerDependency(nativePromiseTracker(activePromise), parentTracker);
-          } else if (!activePromise && suppressNativePromiseConsumption === 0) {
-            markTrackedObservationsConsumed(parentTracker);
-          }
-        },
-      });
-      const workflowResultPromise = compiled.runInContext(context);
-      topLevelWorkflowPromise = workflowResultPromise;
-      markTrackedObservationsConsumed(nativePromiseTracker(workflowResultPromise));
-      value = await workflowResultPromise;
-    } finally {
-      try {
-        stopWorkflowPromiseHook?.();
-      } finally {
-        try {
-          if (nativeThenDescriptor.configurable) Object.defineProperty(nativePromisePrototype, "then", nativeThenDescriptor);
-        } finally {
-          topLevelWorkflowPromise = undefined;
-          activeNativePromises.length = 0;
-          suppressNativePromiseConsumption = 0;
-          nativePromiseTrackers = new WeakMap();
-          nativePromiseParents = new WeakMap();
-        }
-      }
-    }
-    const persistedValue = value === undefined ? null : omitUndefinedWorkflowValues(value);
-    try {
-      assertJsonValue(persistedValue, "return");
-    } catch (error) {
-      parentPort.postMessage({ type: "error", errorKind: "return-serialization", errorPhase: "return-serialization", error: formatWorkflowScriptError(error) });
-      return;
-    }
-    parentPort.postMessage({ type: "complete", value: persistedValue });
-  } catch (error) {
-    postWorkflowError(error);
-  }
-});
-`;
 
 export interface WorkflowScriptChildResult {
 	key: string;
@@ -1143,7 +75,7 @@ export interface WorkflowScriptChildResult {
 	continuation?: { runIds: string[] };
 	artifactPaths: string[];
 	results?: SingleResult[];
-	/** Came from a runtime-replaced run of the same script (and args, unless named by options.reuseFrom): its saved result, or its still-running child re-attached; this run launched nothing. */
+	/** Came from a runtime-replaced or owner-exited run of the same script (and args, unless named by options.reuseFrom): its saved result, or its still-running child re-attached; this run launched nothing. */
 	reused?: boolean;
 }
 
@@ -1278,6 +210,8 @@ export interface RunWorkflowScriptOptions {
 		set: (key: string, value: unknown) => void | Promise<void>;
 	};
 	registerStopChild?: (stop: ((key: string, message?: string) => boolean) | undefined) => void;
+	/** Drain: stop children that have not started, refuse new launches, and call `onDrained` once every started child has a result. Returns the started-child count. */
+	registerDrain?: (drain: ((onDrained: () => void) => number) | undefined) => void;
 	onTrace?: (trace: WorkflowScriptTraceEntry[]) => void;
 	onLanePlan?: (lanes: WorkflowLanePlan[]) => void;
 	onEmit?: (emits: unknown[]) => void;
@@ -1344,8 +278,185 @@ const RECOVERY_REVIEW_NO_ANAPHORIC_MUTATION_CLAUSE_PATTERN = /\b(?:do not|don't|
 const RECOVERY_REVIEW_NO_DELEGATION_CLAUSE_PATTERN = /\b(?:do not|don't|must not)\s+(?:(?:launch|start|spawn|run)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)|(?:get|let|request|hand\s+off|assign|use|have|tell)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)|(?:get|let|have|tell|request)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:review|implementation|fix(?:es)?|changes?|follow-up)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:from|with|via|by)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)|ask\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:(?:workers?|reviewers?|agents?|subagents?|children|child)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)|(?:review|implementation|fix(?:es)?|changes?|follow-up)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:from|via)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)))\b/gi;
 const RECOVERY_REVIEW_DELEGATION_PATTERN = /\b(?:launch|start|spawn|run)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\b|\b(?:delegate|hand\s+off|assign)\s+(?:remediation|implementation(?:\s+follow-up)?|changes?|fix(?:es)?|follow-up)\s+to\s+(?:(?:a|an|the)\s+)?(?:workers?|reviewers?|agents?|subagents?|children|child)\b|\b(?:get|let|have|tell|request)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child)\b[^,.;!?\n]*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)\b|\b(?:get|let|have|tell|request)\b[^,.;!?\n]*(?:review|implementation|fix(?:es)?|changes?|follow-up)\b[^,.;!?\n]*\b(?:from|with|via|by)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child)\b|\bask\b[^,.;!?\n]*(?:(?:workers?|reviewers?|agents?|subagents?|children|child)\b[^,.;!?\n]*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)|(?:review|implementation|fix(?:es)?|changes?|follow-up)\b[^,.;!?\n]*\b(?:from|via)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child))\b|\buse\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\s+(?:for|to)\s+(?:implementation|follow-up|remediation|fix|edit|write|modify|change|patch|update|delete|remove|create)\b/i;
 const RECOVERY_REVIEW_ANAPHORIC_MUTATION_PATTERN = /\b(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?!(?:\s+(?:(?:now|still|also|already)\s+)*(?:is|are|remains?)\s+blocked\b))(?:(?:[\s,]+\w+){0,4}[\s,]+anyway|(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n]){0,80})(?=\s*(?:[,.;!?\n)]|\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b|$))/i;
-const RECOVERY_REVIEW_DESTRUCTIVE_COMMAND_PATTERN = /(?:^|[\s;,.`'"([{])(?:\S*\/)?(?:rm|rmdir|unlink|truncate|mv|cp|chmod|chown)\b|\bgit\b(?:\s+(?:-[A-Za-z](?:\s+(?:"[^"\n]*"|'[^'\n]*'|\S+))?|--(?:git-dir|work-tree|namespace|exec-path|config-env)(?:=(?:"[^"\n]*"|'[^'\n]*'|\S+)|\s+(?:"[^"\n]*"|'[^'\n]*'|\S+))|--[A-Za-z0-9-]+(?:=(?:"[^"\n]*"|'[^'\n]*'|\S+))?))*\s+(?:add|branch|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|stash|tag|checkout|switch)\b/i;
-const RECOVERY_REVIEW_DASH_LIVE_ACTION_PATTERN = /(?:[—–]|--|\s-\s|:|\s\/\s)\s*(?:then\s+)?(?:(?:add|append|apply|change|cherry[ -]pick|clean|commit|copy|create|delete|edit|fix|implement|insert|make|merge|move|modify|mutate|open|patch|prepend|push|rebase|refactor|remove|rename|replace|revert|revise|rewrite|save|stage|stash|tag|touch|update|write)\b|(?:launch|start|spawn|run)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\b|(?:\S*\/)?(?:rm|rmdir|unlink|truncate|mv|cp|chmod|chown)\b|git\b[^,.;!?\n]*\b(?:add|branch|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|stash|tag|checkout|switch)\b)/i;
+// A path need not cross another command-start separator: the same command can match from
+// the last such separator before its slash. Excluding those characters from the path prefix
+// preserves detection while preventing overlapping starts from rescanning the same suffix.
+const RECOVERY_REVIEW_MUTATING_PATH_COMMAND_PATTERN = /(?:^|[\s;,.`'"([{])(?:[^\s;,.`'"([{]*\/)?(?:rm|rmdir|unlink|truncate|mv|cp|chmod|chown)\b/i;
+const RECOVERY_REVIEW_WORD_CHARACTER_PATTERN = /^\w$/;
+// Each branch after a separator is checked at its own anchor, and what it needs from the rest of the
+// line or path comes from tables built in one backward pass, so many separators never rescan a suffix.
+const RECOVERY_REVIEW_DASH_SEPARATOR_AT_PATTERN = /(?:[—–]|--|\s-\s|:|\s\/\s)/iy;
+const RECOVERY_REVIEW_DASH_SEPARATOR_EXISTS_PATTERN = /(?:[—–]|--|\s-\s|:|\s\/\s)/i;
+const RECOVERY_REVIEW_DASH_ACTION_AT_PATTERN = /(?:add|append|apply|change|cherry[ -]pick|clean|commit|copy|create|delete|edit|fix|implement|insert|make|merge|move|modify|mutate|open|patch|prepend|push|rebase|refactor|remove|rename|replace|revert|revise|rewrite|save|stage|stash|tag|touch|update|write)\b/iy;
+const RECOVERY_REVIEW_DASH_LAUNCH_AT_PATTERN = /(?:launch|start|spawn|run)\b/iy;
+const RECOVERY_REVIEW_DASH_WORKER_AT_PATTERN = /(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\b/iy;
+const RECOVERY_REVIEW_DASH_GIT_AT_PATTERN = /git\b/iy;
+const RECOVERY_REVIEW_DASH_GIT_COMMAND_AT_PATTERN = /\b(?:add|branch|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|stash|tag|checkout|switch)\b/iy;
+const RECOVERY_REVIEW_DASH_FILE_COMMAND_AT_PATTERN = /(?:rm|rmdir|unlink|truncate|mv|cp|chmod|chown)\b/iy;
+const RECOVERY_REVIEW_DASH_THEN_AT_PATTERN = /then/iy;
+const RECOVERY_REVIEW_DASH_LINE_STOP_CHARACTERS = ",.;!?\n";
+const RECOVERY_REVIEW_WHITESPACE_CHARACTER_PATTERN = /^\s$/;
+
+// Sticky patterns: lastIndex anchors each check. No check yields, so the shared lastIndex cannot interleave.
+function matchesDashBranchAt(pattern: RegExp, text: string, index: number): boolean {
+	pattern.lastIndex = index;
+	return pattern.test(text);
+}
+
+function dashBranchLengthAt(pattern: RegExp, text: string, index: number): number {
+	pattern.lastIndex = index;
+	const match = pattern.exec(text);
+	return match === null ? 0 : match[0].length;
+}
+
+function skipDashSeparatorWhitespace(text: string, index: number): number {
+	while (index < text.length && RECOVERY_REVIEW_WHITESPACE_CHARACTER_PATTERN.test(text.charAt(index))) index++;
+	return index;
+}
+
+// workerAhead[i] says whether the rest of the line still holds the worker word, gitCommandAhead[i]
+// the same for a git command, and pathCommandAhead[i] whether the rest of the path holds a file
+// command behind a slash.
+function acceptsDashLiveActionAt(text: string, index: number, workerAhead: Uint8Array, gitCommandAhead: Uint8Array, pathCommandAhead: Uint8Array): boolean {
+	if (matchesDashBranchAt(RECOVERY_REVIEW_DASH_ACTION_AT_PATTERN, text, index)) return true;
+	const launchLength = dashBranchLengthAt(RECOVERY_REVIEW_DASH_LAUNCH_AT_PATTERN, text, index);
+	if (launchLength > 0 && workerAhead[index + launchLength] === 1) return true;
+	if (matchesDashBranchAt(RECOVERY_REVIEW_DASH_FILE_COMMAND_AT_PATTERN, text, index) || pathCommandAhead[index] === 1) return true;
+	return matchesDashBranchAt(RECOVERY_REVIEW_DASH_GIT_AT_PATTERN, text, index) && gitCommandAhead[index + 3] === 1;
+}
+
+function mentionsDashLiveAction(text: string): boolean {
+	if (!RECOVERY_REVIEW_DASH_SEPARATOR_EXISTS_PATTERN.test(text)) return false;
+	const workerAhead = new Uint8Array(text.length + 1);
+	const gitCommandAhead = new Uint8Array(text.length + 1);
+	const pathCommandAhead = new Uint8Array(text.length + 1);
+	for (let index = text.length - 1; index >= 0; index--) {
+		const character = text.charAt(index);
+		const lineCharacter = !RECOVERY_REVIEW_DASH_LINE_STOP_CHARACTERS.includes(character);
+		const pathCharacter = !RECOVERY_REVIEW_WHITESPACE_CHARACTER_PATTERN.test(character);
+		workerAhead[index] = matchesDashBranchAt(RECOVERY_REVIEW_DASH_WORKER_AT_PATTERN, text, index) || (lineCharacter && workerAhead[index + 1] === 1) ? 1 : 0;
+		gitCommandAhead[index] = matchesDashBranchAt(RECOVERY_REVIEW_DASH_GIT_COMMAND_AT_PATTERN, text, index) || (lineCharacter && gitCommandAhead[index + 1] === 1) ? 1 : 0;
+		pathCommandAhead[index] = (character === "/" && matchesDashBranchAt(RECOVERY_REVIEW_DASH_FILE_COMMAND_AT_PATTERN, text, index + 1)) || (pathCharacter && pathCommandAhead[index + 1] === 1) ? 1 : 0;
+	}
+	for (let index = 0; index < text.length; index++) {
+		const separatorLength = dashBranchLengthAt(RECOVERY_REVIEW_DASH_SEPARATOR_AT_PATTERN, text, index);
+		if (separatorLength === 0) continue;
+		// \s* and then\s+ only cross whitespace, and no branch starts with whitespace, so the end
+		// of that whitespace run is the only anchor a branch can match at.
+		const anchor = skipDashSeparatorWhitespace(text, index + separatorLength);
+		if (acceptsDashLiveActionAt(text, anchor, workerAhead, gitCommandAhead, pathCommandAhead)) return true;
+		if (!matchesDashBranchAt(RECOVERY_REVIEW_DASH_THEN_AT_PATTERN, text, anchor)) continue;
+		const afterThen = skipDashSeparatorWhitespace(text, anchor + 4);
+		if (afterThen > anchor + 4 && acceptsDashLiveActionAt(text, afterThen, workerAhead, gitCommandAhead, pathCommandAhead)) return true;
+	}
+	return false;
+}
+
+type GitCommandState = {
+	edges: Array<{ character: RegExp; next: GitCommandState }>;
+	epsilon: GitCommandState[];
+};
+
+// This is the git branch of the dash-live check, not a shell parser. afterOption and
+// afterSpace implement (\s+OPTION)*\s+; short/special options can also take \s+V,
+// generic long options only =V. V keeps "[^"\n]*", '[^'\n]*' and \S+ alive together.
+function createMutatingGitStates(): { start: GitCommandState; accept: GitCommandState } {
+	const state = (): GitCommandState => ({ edges: [], epsilon: [] });
+	const edge = (from: GitCommandState, character: RegExp, next: GitCommandState): void => {
+		from.edges.push({ character, next });
+	};
+	const literal = (from: GitCommandState, word: string, end: GitCommandState): void => {
+		for (let index = 0; index < word.length; index++) {
+			const next = index === word.length - 1 ? end : state();
+			edge(from, new RegExp(word.charAt(index), "i"), next);
+			from = next;
+		}
+	};
+	const start = state();
+	const accept = state();
+	const afterOption = state();
+	const afterSpace = state();
+	literal(start, "git", afterOption);
+	edge(afterOption, /\s/, afterSpace);
+	edge(afterSpace, /\s/, afterSpace);
+	for (const command of ["add", "branch", "cherry-pick", "clean", "commit", "merge", "rebase", "reset", "restore", "revert", "stash", "tag", "checkout", "switch"]) {
+		literal(afterSpace, command, accept);
+	}
+
+	const value = state();
+	const beforeSeparatedValue = state();
+	const separatedValue = state();
+	edge(beforeSeparatedValue, /\s/, separatedValue);
+	edge(separatedValue, /\s/, separatedValue);
+	separatedValue.epsilon.push(value);
+
+	const shortDash = state();
+	const shortOption = state();
+	literal(afterSpace, "-", shortDash);
+	edge(shortDash, /[A-Za-z]/, shortOption);
+	shortOption.epsilon.push(afterOption, beforeSeparatedValue);
+
+	const longStart = state();
+	const longName = state();
+	literal(shortDash, "-", longStart);
+	edge(longStart, /[A-Za-z0-9-]/, longName);
+	edge(longName, /[A-Za-z0-9-]/, longName);
+	longName.epsilon.push(afterOption);
+	edge(longName, /=/, value);
+	for (const option of ["git-dir", "work-tree", "namespace", "exec-path", "config-env"]) {
+		const specialOption = state();
+		literal(longStart, option, specialOption);
+		edge(specialOption, /=/, value);
+		specialOption.epsilon.push(beforeSeparatedValue);
+	}
+
+	for (const [quote, body] of [[/"/, /[^"\n]/], [/'/, /[^'\n]/]] as const) {
+		const quotedValue = state();
+		edge(value, quote, quotedValue);
+		edge(quotedValue, body, quotedValue);
+		edge(quotedValue, quote, afterOption);
+	}
+	const plainValue = state();
+	edge(value, /\S/, plainValue);
+	edge(plainValue, /\S/, plainValue);
+	plainValue.epsilon.push(afterOption);
+	return { start, accept };
+}
+
+const MUTATING_GIT_STATES = createMutatingGitStates();
+
+function mentionsMutatingGitCommand(text: string): boolean {
+	let active = new Set<GitCommandState>();
+	let next = new Set<GitCommandState>();
+	const addState = (states: Set<GitCommandState>, state: GitCommandState): void => {
+		if (states.has(state)) return;
+		states.add(state);
+		for (const reachable of state.epsilon) addState(states, reachable);
+	};
+	// Inject starts even inside another candidate's value. Deduplicating states at each UTF-16
+	// position preserves every reading without backtracking or suffix rescans: O(n*m) time and
+	// O(m) space for this fixed graph of m states. /i (without /u) uses ASCII word boundaries.
+	for (let position = 0; position <= text.length; position++) {
+		const character = text.charAt(position);
+		const previousIsWord = RECOVERY_REVIEW_WORD_CHARACTER_PATTERN.test(text.charAt(position - 1));
+		const currentIsWord = RECOVERY_REVIEW_WORD_CHARACTER_PATTERN.test(character);
+		if (active.has(MUTATING_GIT_STATES.accept) && previousIsWord !== currentIsWord) return true;
+		if (!previousIsWord) addState(active, MUTATING_GIT_STATES.start);
+		if (position === text.length) break;
+		next.clear();
+		for (const state of active) {
+			for (const edge of state.edges) {
+				if (edge.character.test(character)) addState(next, edge.next);
+			}
+		}
+		[active, next] = [next, active];
+	}
+	return false;
+}
+
+function mentionsMutatingCommand(text: string): boolean {
+	return RECOVERY_REVIEW_MUTATING_PATH_COMMAND_PATTERN.test(text) || mentionsMutatingGitCommand(text);
+}
 
 function isExplicitReadOnlyRecoveryReview(params: Record<string, unknown>): boolean {
 	const agent = typeof params.agent === "string" ? params.agent.trim() : "";
@@ -1423,12 +534,12 @@ function isExplicitReadOnlyRecoveryReview(params: Record<string, unknown>): bool
 		&& agent !== ""
 		&& /\b(?:advisor|oracle|review|reviewer)\b/i.test(agent)
 		&& RECOVERY_REVIEW_READ_ONLY_PATTERN.test(task)
-		&& !RECOVERY_REVIEW_DESTRUCTIVE_COMMAND_PATTERN.test(taskDestructiveCommandText)
+		&& !mentionsMutatingCommand(taskDestructiveCommandText)
 		&& !RECOVERY_REVIEW_MUTATION_VERB_PATTERN.test(taskMutationText)
 		&& !RECOVERY_REVIEW_DELEGATION_PATTERN.test(taskMutationText)
 		&& !RECOVERY_REVIEW_ANAPHORIC_MUTATION_PATTERN.test(taskMutationText)
-		&& !RECOVERY_REVIEW_DESTRUCTIVE_COMMAND_PATTERN.test(taskMutationText)
-		&& !RECOVERY_REVIEW_DASH_LIVE_ACTION_PATTERN.test(taskDashLiveActionText);
+		&& !mentionsMutatingCommand(taskMutationText)
+		&& !mentionsDashLiveAction(taskDashLiveActionText);
 }
 
 function recoveryBarrierMessage(sourceKey: string, target: string): string {
@@ -1752,24 +863,59 @@ function directObjectPropertyValue(node: AstNode, name: string): AstNode | undef
 	return value;
 }
 
-function validateStaticBaseRef(params: AstNode, owner: string): WorkflowScriptValidationError[] {
-	if (params.type !== "ObjectExpression" || !Array.isArray(params.properties)) return [];
-	// Inspect the final definition only. A later spread or unknown key may overwrite it.
-	for (let index = params.properties.length - 1; index >= 0; index--) {
-		const property = params.properties[index];
-		if (!astNode(property) || property.type !== "Property") return [];
+function arrayElements(node: unknown): unknown[] {
+	return astNode(node) && node.type === "ArrayExpression" && Array.isArray(node.elements) ? node.elements : [];
+}
+
+/** The final definition of `name` in an object literal; undefined when a later spread or unknown key may overwrite it. */
+function finalStaticProperty(node: AstNode, name: string): AstNode | undefined {
+	if (node.type !== "ObjectExpression" || !Array.isArray(node.properties)) return undefined;
+	for (let index = node.properties.length - 1; index >= 0; index--) {
+		const property = node.properties[index];
+		if (!astNode(property) || property.type !== "Property") return undefined;
 		const key = staticPropertyKey(property);
-		if (key === undefined) return [];
-		if (key !== "baseRef") continue;
-		if (property.kind !== "init" || !astNode(property.value)) return [];
-		const valueNode = property.value;
-		const value = literalString(valueNode);
-		if ((value !== undefined || valueNode.type === "Literal") && !validGitRef(value)) {
-			return [{ message: `${owner} ${BASE_REF_VALIDATION_ERROR}`, ...nodeLocation(valueNode) }];
-		}
-		return [];
+		if (key === undefined) return undefined;
+		if (key === name) return property;
 	}
-	return [];
+	return undefined;
+}
+
+function validateStaticBaseRef(params: AstNode, owner: string): WorkflowScriptValidationError[] {
+	const property = finalStaticProperty(params, "baseRef");
+	if (property?.kind !== "init" || !astNode(property.value)) return [];
+	const valueNode = property.value;
+	const value = literalString(valueNode);
+	return (value !== undefined || valueNode.type === "Literal") && !validGitRef(value)
+		? [{ message: `${owner} ${BASE_REF_VALIDATION_ERROR}`, ...nodeLocation(valueNode) }]
+		: [];
+}
+
+// Same text as validateLaneSpecs in workflow-script-worker.cjs; a test compares the two.
+const LANE_RETAINED_RESUME_ERROR = "cannot resume a retained run id in runs.lanes; use runs.run(key, { resume: id }) outside lanes, or start the lane with an agent stage and use resume: \"previous\" later.";
+
+// A spread or unknown computed key on the lane can replace `stages`.
+function staticLane(lane: unknown): lane is AstNode {
+	return astNode(lane) && lane.type === "ObjectExpression" && Array.isArray(lane.properties)
+		&& lane.properties.every((property) => astNode(property) && property.type === "Property" && staticPropertyKey(property) !== undefined);
+}
+
+/** The launch-time first-stage resume rule, for lanes written out as literals. */
+function validateStaticLaneResumes(call: AstNode): WorkflowScriptValidationError[] {
+	const args = Array.isArray(call.arguments) ? call.arguments : [];
+	const lanes = arrayElements(args[0]);
+	const errors: WorkflowScriptValidationError[] = [];
+	for (let laneIndex = 0; laneIndex < lanes.length; laneIndex++) {
+		const lane = lanes[laneIndex];
+		// A spread shifts every later lane index the runtime reports.
+		if (astNode(lane) && lane.type === "SpreadElement") break;
+		if (!staticLane(lane)) continue;
+		const first = arrayElements(directObjectPropertyValue(lane, "stages"))[0];
+		if (!astNode(first)) continue;
+		const property = finalStaticProperty(first, "resume");
+		const resume = property?.kind === "init" ? literalString(property.value) : undefined;
+		if (resume !== undefined && resume !== "previous") errors.push({ message: `runs.lanes lane ${laneIndex} stage 0 ${LANE_RETAINED_RESUME_ERROR}`, ...nodeLocation(first) });
+	}
+	return errors;
 }
 
 // Children with their own cwd, agentScope, or resume resolve agents elsewhere, and a
@@ -1788,16 +934,12 @@ function staticChildAgentNode(params: unknown): AstNode | undefined {
 
 function validateStaticChildAgents(call: AstNode, agentNameError: (name: string) => string | undefined): WorkflowScriptValidationError[] {
 	const args = Array.isArray(call.arguments) ? call.arguments : [];
-	const elements = (node: unknown): unknown[] => astNode(node) && node.type === "ArrayExpression" && Array.isArray(node.elements) ? node.elements : [];
-	// A spread or unknown computed key on the lane can replace `stages`.
-	const staticLane = (lane: unknown): lane is AstNode => astNode(lane) && lane.type === "ObjectExpression" && Array.isArray(lane.properties)
-		&& lane.properties.every((property) => astNode(property) && property.type === "Property" && staticPropertyKey(property) !== undefined);
 	const children: Array<{ owner: string; params: unknown }> = directRunsCall(call, "run")
 		? [{ owner: "runs.run", params: args[1] }]
 		: directRunsCall(call, "all")
-			? elements(args[0]).map((params) => ({ owner: "runs.all item", params }))
+			? arrayElements(args[0]).map((params) => ({ owner: "runs.all item", params }))
 			: directRunsCall(call, "lanes")
-				? elements(args[0]).flatMap((lane) => staticLane(lane) ? elements(directObjectPropertyValue(lane, "stages")).map((params) => ({ owner: "runs.lanes stage", params })) : [])
+				? arrayElements(args[0]).flatMap((lane) => staticLane(lane) ? arrayElements(directObjectPropertyValue(lane, "stages")).map((params) => ({ owner: "runs.lanes stage", params })) : [])
 				: [];
 	const errors: WorkflowScriptValidationError[] = [];
 	for (const child of children) {
@@ -1811,13 +953,45 @@ function validateStaticChildAgents(call: AstNode, agentNameError: (name: string)
 
 function directRunsAllKeys(call: AstNode): Array<{ key: string; node: AstNode }> {
 	const args = Array.isArray(call.arguments) ? call.arguments : [];
-	const items = astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements) ? args[0].elements : [];
-	return items.flatMap((item) => {
+	return arrayElements(args[0]).flatMap((item) => {
 		if (!astNode(item)) return [];
 		const keyNode = directObjectPropertyValue(item, "key");
 		const key = literalString(keyNode);
 		return keyNode && key !== undefined ? [{ key, node: keyNode }] : [];
 	});
+}
+
+/** runs.all items certain to reach the runtime without a key: plain literals in the array, or the one result of a map callback. */
+function keylessRunsAllItems(call: AstNode): Array<{ node: AstNode; index?: number }> {
+	const args = Array.isArray(call.arguments) ? call.arguments : [];
+	const items = args[0];
+	if (!astNode(items)) return [];
+	if (items.type === "ArrayExpression" && Array.isArray(items.elements)) {
+		return items.elements.flatMap((item, index) => keylessItemLiteral(item) ? [{ node: item, index }] : []);
+	}
+	const callee = items.type === "CallExpression" && astNode(items.callee) && items.callee.type === "MemberExpression" && items.callee.computed !== true ? items.callee : undefined;
+	if (!callee || !astNode(callee.property) || callee.property.type !== "Identifier" || callee.property.name !== "map") return [];
+	const callback = Array.isArray(items.arguments) ? items.arguments[0] : undefined;
+	if (!astNode(callback) || (callback.type !== "ArrowFunctionExpression" && callback.type !== "FunctionExpression") || !astNode(callback.body)) return [];
+	let result: unknown = callback.body;
+	if (callback.body.type === "BlockStatement" && Array.isArray(callback.body.body)) {
+		// Only a callback whose single return is its last statement always returns that literal.
+		const returns: AstNode[] = [];
+		walkAst(callback.body, (node) => { if (node.type === "ReturnStatement") returns.push(node); }, false);
+		result = returns.length === 1 && returns[0] === callback.body.body.at(-1) ? returns[0]!.argument : undefined;
+	}
+	return keylessItemLiteral(result) ? [{ node: result }] : [];
+}
+
+/**
+ * An object literal whose own keys are all visible (no spread, getter, setter, or computed key) and has no `key`.
+ * A thenable item (`{ then: child.then }`) is awaited as a launched child, so only the runtime can check it.
+ */
+function keylessItemLiteral(node: unknown): node is AstNode {
+	return astNode(node) && node.type === "ObjectExpression" && Array.isArray(node.properties)
+		// `__proto__: base` sets the prototype, and the runtime's destructuring reads a `key` found there.
+		&& node.properties.every((property) => astNode(property) && property.type === "Property" && property.kind === "init" && property.computed !== true && staticPropertyKey(property) !== "__proto__")
+		&& !directObjectPropertyValue(node, "key") && !directObjectPropertyValue(node, "then");
 }
 
 function containsWorkflowLaunch(node: unknown): boolean {
@@ -1945,7 +1119,13 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 		const location = error && typeof error === "object" && "loc" in error && error.loc && typeof error.loc === "object"
 			? error.loc as { line?: unknown; column?: unknown }
 			: undefined;
-		const message = (error instanceof Error ? error.message : String(error)).replace(/\s+\(\d+:\d+\)$/, "");
+		const parserMessage = (error instanceof Error ? error.message : String(error)).replace(/\s+\(\d+:\d+\)$/, "");
+		const source = script.trim();
+		// A path passed where source is expected parses as a regex or a stray token. Keep the parser's
+		// message too: a one-token script can also be a real syntax error.
+		const message = /^\S+$/.test(source) && (/^(?:~|\.{1,2})?\//.test(source) || /\.(?:[cm]?[jt]s|json)$/.test(source))
+			? `${parserMessage}. The script looks like a file path ('${source}'): options.script takes the script's source text; pass a script file as workflow: "${source}".`
+			: parserMessage;
 		return { ok: false, errors: [{ message, ...(typeof location?.line === "number" ? { line: Math.max(1, location.line - 1) } : {}), ...(typeof location?.column === "number" ? { column: location.column + 1 } : {}) }] };
 	}
 
@@ -1954,16 +1134,19 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 		: undefined;
 	const workflowBody = wrapper && astNode(wrapper.body) ? wrapper.body : root;
 	// A rebound `runs` may not be the workflow API, so its calls prove nothing about child launches.
-	const agentNameError = options.agentNameError && !invalidatesRunsBinding(workflowBody) ? options.agentNameError : undefined;
+	const runsRebound = invalidatesRunsBinding(workflowBody);
+	const agentNameError = options.agentNameError && !runsRebound ? options.agentNameError : undefined;
 	walkAst(workflowBody, (node) => {
 		if (node !== wrapper && node.async === true && (node.type === "FunctionDeclaration" || node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression")) {
 			errors.push({ message: "workflowScript does not support nested async functions. Use top-level await, plain helper functions that return runs.run(...), or explicit Promise chains.", ...nodeLocation(node) });
 		}
+		if (node.type === "ImportExpression") errors.push({ message: "workflowScript cannot load modules with import().", ...nodeLocation(node) });
 		if (directRunsCall(node, "run")) {
 			const args = Array.isArray(node.arguments) ? node.arguments : [];
 			const keyNode = astNode(args[0]) ? args[0] : undefined;
 			const key = literalString(keyNode);
 			if (keyNode && key !== undefined && !KEY_PATTERN.test(key)) errors.push({ message: "runs.run key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", ...nodeLocation(keyNode) });
+			if (keyNode?.type === "ObjectExpression" && !runsRebound) errors.push({ message: `runs.run expects (key, params); got an object as the first argument. Use runs.run("plan", { agent, task }) or runs.all([{ key, agent, task }]).`, ...nodeLocation(keyNode) });
 			if (astNode(args[1])) {
 				errors.push(...validateStaticBaseRef(args[1], "runs.run"));
 				const message = definitelyNonJson(args[1]);
@@ -1972,16 +1155,19 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 		}
 		if (directRunsCall(node, "all")) {
 			for (const entry of directRunsAllKeys(node)) if (!KEY_PATTERN.test(entry.key)) errors.push({ message: "runs.all item key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", ...nodeLocation(entry.node) });
+			if (!runsRebound) for (const item of keylessRunsAllItems(node)) {
+				const subject = item.index === undefined ? "runs.all items built by this map(...) callback have no key" : `runs.all item ${item.index} has no key`;
+				errors.push({ message: `${subject}; every runs.all item needs a stable key, for example runs.all([{ key: "review", agent, task }]).`, ...nodeLocation(item.node) });
+			}
 			const args = Array.isArray(node.arguments) ? node.arguments : [];
-			if (astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements)) {
-				for (const item of args[0].elements) if (astNode(item)) {
-					errors.push(...validateStaticBaseRef(item, "runs.all item"));
-					const message = definitelyNonJson(item);
-					if (message) errors.push({ message: `runs.all item params are invalid: ${message}.`, ...nodeLocation(item) });
-				}
+			for (const item of arrayElements(args[0])) if (astNode(item)) {
+				errors.push(...validateStaticBaseRef(item, "runs.all item"));
+				const message = definitelyNonJson(item);
+				if (message) errors.push({ message: `runs.all item params are invalid: ${message}.`, ...nodeLocation(item) });
 			}
 		}
 		if (directRunsCall(node, "host")) errors.push(...validateStaticHostCall(node));
+		if (directRunsCall(node, "lanes") && !runsRebound) errors.push(...validateStaticLaneResumes(node));
 		if (agentNameError) errors.push(...validateStaticChildAgents(node, agentNameError));
 		const boundaryValue = node.type === "CallExpression" && astNode(node.callee) && node.callee.type === "Identifier" && node.callee.name === "emit" && Array.isArray(node.arguments) && astNode(node.arguments[0])
 			? node.arguments[0]
@@ -2011,7 +1197,7 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 				const keys = new Set(directRunsAllKeys(declaration.init.argument).map((entry) => entry.key));
 				if (keys.size === 0) continue;
 				const args = Array.isArray(declaration.init.argument.arguments) ? declaration.init.argument.arguments : [];
-				const itemCount = astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements) ? args[0].elements.length : 0;
+				const itemCount = arrayElements(args[0]).length;
 				const arrayResultShape = Array.from({ length: itemCount });
 				for (const later of laterStatements) {
 					walkAstWithoutShadowedIdentifier(later, name, (node) => {
@@ -2149,9 +1335,9 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	} catch (error) {
 		throw new WorkflowScriptError("Workflow parser dependency 'acorn' is unavailable from pi-subagents. Reinstall pi-subagents dependencies before launching workflowScript.", emptyPartial(), "runtime", { cause: error });
 	}
-	let worker: Worker;
+	let worker: ReturnType<typeof createWorkflowScriptWorker>;
 	try {
-		worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { acornPath } });
+		worker = createWorkflowScriptWorker(acornPath);
 	} catch (error) {
 		throw new WorkflowScriptError(`Workflow worker could not start: ${error instanceof Error ? error.message : String(error)}`, emptyPartial(), "runtime", { cause: error });
 	}
@@ -2160,7 +1346,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const trace: WorkflowScriptTraceEntry[] = [];
 	const children = new Map<string, WorkflowScriptChildResult>();
 	const childOrder: string[] = [];
-	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean; generatedLaneKey?: string }>();
+	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean; generatedLaneKey?: string; reuseTraced?: boolean }>();
 	const steers = new Map<number, { key: string; promise: Promise<WorkflowSteerResult>; observed: boolean }>();
 	const hostCalls = new Map<number, { key: string; promise: Promise<WorkflowHostCommandResult>; observed: boolean }>();
 	const stoppedLaunches = new Set<string>();
@@ -2173,6 +1359,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	let acceptanceRecoveryBarrier: { key: string } | undefined;
 	let settled = false;
 	let finishing = false;
+	let draining = false;
+	let onDrained: (() => void) | undefined;
+	// Keys past the concurrency semaphore: a drain lets these finish and stops the rest.
+	const acquiredLaunches = new Set<string>();
 	let assemblyAbortRequested = false;
 	let assemblyFlushTimer: ReturnType<typeof setTimeout> | undefined;
 	let abortError: Error | undefined;
@@ -2219,6 +1409,12 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const recordAcceptanceRecoveryBarrier = (key: string, result: WorkflowScriptChildResult): void => {
 		if (isAcceptanceMetadataRecovery(result)) acceptanceRecoveryBarrier = { key };
 	};
+	const drainIfIdle = (): void => {
+		if (!onDrained || [...launches.keys()].some((key) => !children.has(key))) return;
+		const done = onDrained;
+		onDrained = undefined;
+		done();
+	};
 	const stopChild = (key: string, message = `Workflow child '${key}' stopped.`): boolean => {
 		if (!launches.has(key) || children.has(key)) return false;
 		stoppedLaunches.add(key);
@@ -2236,7 +1432,18 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			error: message,
 		});
 		traceChanged();
+		drainIfIdle();
 		return true;
+	};
+	const drain = (done: () => void): number => {
+		if (!draining) {
+			draining = true;
+			onDrained = done;
+		}
+		for (const key of launches.keys()) if (!acquiredLaunches.has(key)) stopChild(key, WORKFLOW_DRAIN_CHILD_MESSAGE);
+		const started = [...launches.keys()].filter((key) => !children.has(key)).length;
+		drainIfIdle();
+		return started;
 	};
 	const notifyChildSettled = (key: string, result: WorkflowScriptChildResult): void => {
 		if (result.state === "running" || !options.onChildSettled || !options.workflowRunId) return;
@@ -2264,6 +1471,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		}
 	};
 	options.registerStopChild?.(stopChild);
+	options.registerDrain?.(drain);
 
 	return await new Promise<WorkflowScriptResult>((resolve, reject) => {
 		const finish = (outcome: { value: unknown } | { error: Error & { workflowErrorKind?: unknown } }) => {
@@ -2278,6 +1486,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				if (settled) return;
 				settled = true;
 				options.registerStopChild?.(undefined);
+				options.registerDrain?.(undefined);
 				if (timer) clearTimeout(timer);
 				options.signal?.removeEventListener("abort", onAbort);
 				void worker.terminate();
@@ -2353,7 +1562,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 
 		worker.on("error", (error) => finish({ error: taggedWorkflowError(`Workflow worker failed: ${error instanceof Error ? error.message : String(error)}`, "runtime") }));
 		worker.on("exit", (code) => {
-			if (!settled && code !== 0) finish({ error: taggedWorkflowError(`Workflow worker exited with code ${code}.`, "runtime") });
+			if (!settled && !finishing) finish({ error: taggedWorkflowError(`Workflow worker exited before returning a result (code ${code}).`, "runtime") });
 		});
 		worker.on("message", (message: Record<string, unknown>) => {
 			if (settled) return;
@@ -2418,7 +1627,8 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			const respond = (promise: Promise<unknown>, responsePath?: string, onBoundaryError?: (error: unknown) => void) => {
 				void promise.then(
 					(value) => {
-						if (settled) return;
+						// While draining, the script gets no answers: a refusal it throws on would abort the started children.
+						if (settled || draining) return;
 						const normalized = responsePath ? omitNonJsonWorkflowResultMetadata(value) : omitUndefinedWorkflowValues(value);
 						if (!responsePath) {
 							worker.postMessage({ type: "response", callId: message.callId, ok: true, value: normalized });
@@ -2433,7 +1643,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						}
 					},
 					(error: unknown) => {
-						if (!settled) {
+						if (!settled && !draining) {
 							const errorKind = error instanceof Error ? (error as { workflowErrorKind?: unknown }).workflowErrorKind : undefined;
 							worker.postMessage({ type: "response", callId: message.callId, ok: false, error: error instanceof Error ? error.message : String(error), ...(isWorkflowScriptFailureKind(errorKind) ? { errorKind } : {}) });
 						}
@@ -2518,6 +1728,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					return respond(Promise.reject(error));
 				}
 				if (acceptanceRecoveryBarrier) return respond(Promise.reject(new Error(recoveryBarrierMessage(acceptanceRecoveryBarrier.key, `runs.host('${key}')`))));
+				if (draining) return respond(Promise.reject(new Error(`runs.host('${key}') refused: the workflow is draining.`)));
 				if (!options.host) return respond(Promise.reject(new Error("runs.host is unavailable in this host context.")));
 				if (hostCalls.size >= HOST_STEP_MAX_COUNT) return respond(Promise.reject(new Error(`workflowScript supports at most ${HOST_STEP_MAX_COUNT} runs.host calls.`)));
 				const startedAt = Date.now();
@@ -2585,8 +1796,13 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (existing) {
 				if (existing.fingerprint !== fingerprint) return respond(Promise.reject(new Error(`Duplicate workflow key '${key}' used with incompatible launch params.`)));
 				if (callObserved) existing.observed = true;
-				trace.push({ operation: "run", key, state: "reused", ...workflowStringMetadata(params), ...(existing.generatedLaneKey ? { generatedLaneKey: existing.generatedLaneKey } : {}) });
-				traceChanged();
+				// Matching params make every later reuse entry identical, and each trace change rewrites the
+				// whole trace to status.json and events.jsonl, so a re-delivery loop would grow without bound.
+				if (!existing.reuseTraced) {
+					existing.reuseTraced = true;
+					trace.push({ operation: "run", key, state: "reused", ...workflowStringMetadata(params), ...(existing.generatedLaneKey ? { generatedLaneKey: existing.generatedLaneKey } : {}) });
+					traceChanged();
+				}
 				return respond(deliver(existing.promise), `runs.run('${key}') result`, (error) => children.set(key, responseBoundaryFailure(key, error)));
 			}
 			const permitError = options.oneUsePermit?.claim(key);
@@ -2594,6 +1810,8 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (options.oneUsePermit && message.args.batch !== undefined) return respond(Promise.reject(new Error("Workflow child permit does not support runs.all.")));
 			if (options.oneUsePermit && params.resume !== undefined) return respond(Promise.reject(new Error("Workflow child permit does not support retained resume.")));
 			if (params.action !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') accepts execution params only; management action is not allowed.`)));
+			// Before admission, which resolves a resume target; the executor would only see this after that.
+			if (params.requireLauncher !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}'): ${REQUIRE_LAUNCHER_SHAPE_ERROR}`)));
 			if (params.workflowScript !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') cannot start a nested workflow script.`)));
 			if (params.tasks !== undefined || params.chain !== undefined || params.parallel !== undefined || params.concurrency !== undefined || params.chainDir !== undefined) {
 				return respond(Promise.reject(new Error(`runs.run('${key}') accepts one child via { agent, task }; use runs.all(...) and JavaScript control flow for orchestration.`)));
@@ -2640,7 +1858,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					return true;
 				});
 				admission = Promise.resolve().then(() => {
-					if (settled || finishing) return;
+					if (settled || finishing || draining) return;
 					for (const call of calls) assertRecoveryBarrierAllowsRun(call.key, call.params);
 					return options.admit?.(calls, childController.signal);
 				});
@@ -2648,6 +1866,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			}
 			let resolvedResumeLineage: string[] | undefined;
 			const promise = admission.then(async () => {
+				if (draining) stopChild(key, WORKFLOW_DRAIN_CHILD_MESSAGE);
 				if (settled || finishing || stoppedLaunches.has(key)) {
 					const reason = childController.signal.reason;
 					const text = children.get(key)?.error ?? (reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "Workflow script aborted.");
@@ -2689,6 +1908,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						const text = children.get(key)?.error ?? (reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "Workflow script aborted.");
 						return stoppedChildResult(key, text);
 					}
+					acquiredLaunches.add(key);
 					const result = await options.launch(key, launchParams, childSignal, { admitted: true, batch: batch !== undefined });
 					const autoResumeParams = setupAbortResumeParams(params, result, childSignal);
 					if (!autoResumeParams) return result;
@@ -2718,6 +1938,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				trace.push(settledEntry);
 				traceChanged();
 				notifyChildSettled(key, normalized);
+				drainIfIdle();
 				return normalized;
 			}, (error: unknown) => {
 				const text = error instanceof Error ? error.message : String(error);
@@ -2728,6 +1949,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				trace.push({ operation: "run", key, state: "failed", durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}), error: text });
 				traceChanged();
 				notifyChildSettled(key, failure);
+				drainIfIdle();
 				return failure;
 			});
 			launches.set(key, { fingerprint, promise, observed: callObserved, ...(generatedLaneKey ? { generatedLaneKey } : {}) });

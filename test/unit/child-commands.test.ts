@@ -76,7 +76,10 @@ describe("child commands using Pi's real bash backend", () => {
 		const commands = createChildCommandRuntime(dir);
 		const bash = commands.wrap(createBashToolDefinition(dir));
 		try {
-			await assert.rejects(bash.execute("fail", { command: "exit 7" }, undefined, undefined, ctx), /code 7/);
+			const failed = await bash.execute("fail", { command: "exit 7" }, undefined, undefined, ctx);
+			assert.equal(failed.isError, true);
+			assert.match(failed.content[0].text, /code 7/);
+			assert.equal(commands.operate("status", "fail").commands[0].state, "failed");
 			await assert.rejects(bash.execute("timeout", { command: "sleep 10", timeout: 0.05 }, undefined, undefined, ctx), /timed out/);
 			assert.equal(commands.operate("status", "timeout").commands[0].state, "failed");
 			const result = await bash.execute("recover", { command: "printf recovered" }, undefined, undefined, ctx);
@@ -234,6 +237,34 @@ describe("command identities and bounded observation", () => {
 			assert.equal(commands.state().commands[0].state, "failed", "run abort is distinct from command cancellation");
 			await until(() => !processAlive(pid), commands.state);
 		} finally { await commands.shutdown(); await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+	});
+
+	it("still yields when the yield timer cannot save command state", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-child-yield-save-"));
+		const commands = createChildCommandRuntime(dir);
+		const statePath = path.join(dir, "commands.json");
+		const custom: ToolDefinition = {
+			name: "bash", label: "Custom shell", description: "Custom execution", parameters: Type.Object({ command: Type.String() }),
+			async execute(_id, _params, inputSignal) {
+				await new Promise<void>((_resolve, reject) => { inputSignal!.addEventListener("abort", () => reject(new Error("cancelled")), { once: true }); });
+				return { content: [], details: undefined };
+			},
+		};
+		try {
+			const pending = commands.wrap(custom).execute("blocked", { command: "wait", yieldTimeMs: 20 }, undefined, undefined, ctx);
+			// A directory in place of commands.json makes the timer's atomic rename fail on the real filesystem.
+			fs.rmSync(statePath);
+			fs.mkdirSync(statePath);
+			fs.writeFileSync(path.join(statePath, "occupied"), "");
+			const yielded = await pending;
+			assert.match(yielded.content[0].text, /still running/);
+			assert.match(yielded.content[0].text, /saved state is out of date/);
+			assert.equal(commands.operate("status", "blocked").commands[0].state, "yielded");
+		} finally {
+			fs.rmSync(statePath, { recursive: true, force: true });
+			await commands.shutdown();
+			await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+		}
 	});
 
 });

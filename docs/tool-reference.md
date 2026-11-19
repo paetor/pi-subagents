@@ -82,7 +82,7 @@ The `subagent` tool schema lists `agent`, `task`, `workflow`, `args`, `async`, `
 | `options.context` | `fresh \| fork \| profile` | global or per-agent default, else `fresh` | Explicit `fresh` or `fork` overrides every workflow child. `profile` requires the selected agent's declared `defaultContext` and ignores config `defaultSubagentContext`; missing agent defaults fail. When omitted, [`defaultSubagentContext`](configuration.md#defaultsubagentcontext) wins over each agent's `defaultContext`; implicit fork falls back to fresh without a persisted parent session and leaf. Explicit fork is strict. Packaged `worker` defaults to `fresh`; packaged `oracle` and `advisor` default to `fork`. |
 | `model` | string | agent default | An exact `provider/id`; bare ids resolve only if unique, and agent names are not model ids. An unknown or ambiguous model fails with up to 5 closest registry ids to copy; `{action:"models"}` lists them all. A suffix such as `provider/id:high` (`off/minimal/low/medium/high/xhigh/max`) overrides agent thinking. The `thinking` field is only for `watchdog.configure`, ignored on dispatch. On the `claude-code` and `claude-code-writer` adapters the model is Claude Code's own alias or id, and the same suffix becomes its `--effort`, bounded by `subagents.maxThinking` and by an enforced `subagents.modelScope`. |
 | `options.missionId` | string | - | Attach a workflow, including each fire of `schedule.create`, to an existing project mission. Scheduled attachment uses ordinary lifecycle and retention rules. |
-| `options.reuseFrom` | string | - | Exact id of an async workflow run stopped by a runtime replacement (`workflow.stopCause: "runtime-replaced"`). An async relaunch of the same script in the same cwd, from any session, reuses that run's finished children and waits for its running ones; see [Workflows](workflows.md). |
+| `options.reuseFrom` | string | - | Exact id of an async workflow run stopped by a runtime replacement or whose Pi process exited (`workflow.stopCause: "runtime-replaced"` or `"owner-exited"`). An async relaunch of the same script in the same cwd, from any session, reuses that run's finished children and waits for its running ones; see [Workflows](workflows.md). |
 | `options.mission` | object/false | auto-create | Override the default enclosing mission with `{ title \| summary, objective?, goal?, budget?, labels? }`. Set exactly one non-empty `title` or `summary`; `objective` and `labels` are optional. `goal` may only be `true`, requires `budget.tokens`, and enables continuation notices. Pass `false` for an intentionally ephemeral workflow with no mission for it or its children and no `state` global. Explicit mission persistence failures are strict. |
 | `options.handoffPath` | string | - | Aggregate handoff manifest for `action: "worktree.discard"` or lane evidence actions, or optional explicit metadata for `action: "worktree.cleanup"`. |
 | `options.repo` | string | runtime cwd | Repository path for `action: "worktree.cleanup"`; required explicitly for apply. The configured worktree base filters candidates by their per-project folder under it but never discovers them. |
@@ -95,6 +95,7 @@ The `subagent` tool schema lists `agent`, `task`, `workflow`, `args`, `async`, `
 | `options.view` | `fleet \| transcript` | - | Optional `status` view for the active fleet surface or transcript tail inspection. |
 | `options.lines` | number | `80` | Maximum transcript lines for `action: "status"` with `options.view: "transcript"`; capped at 500. |
 | `options.agentScope` | `user \| project \| both` | `both` | Agent discovery scope. Project wins on collisions. |
+| `options.search` | string | - | With `action: "list"`, show only agents whose name, alias, or description contains this text (case-insensitive). |
 | `options.capabilities` | boolean | `false` | With `action: "list"`, return compact prompt-free rows and `details.agentCapabilities` machine-readable records for each agent's declared/default routing capabilities. External CLI rows also include their command and passive local availability. |
 
 ### Execution parameters
@@ -105,15 +106,15 @@ The `subagent` tool schema lists `agent`, `task`, `workflow`, `args`, `async`, `
 | `options.chatProgress` | `auto \| off \| live-card` | `auto` | Workflow chat projection. `auto` renders a live in-chat card only for watched foreground workflows in the same Git repository, including managed worktrees; it is off otherwise. Explicit `live-card` requires `async:false` and the same Git repository. Async workflows have no inline live card, so omit `chatProgress` or use `auto`/`off`; use `async:false` only when the parent must block. |
 | `isolation` | `none \| worktree` | - | Alias kept at the top level; prefer `worktree`. Workflow child isolation. `none` runs in the shared cwd and does not need Git. `worktree` requires a managed Git worktree. Do not combine it with a contradictory `worktree` value. |
 | `options.baseRef` | string | `HEAD` | `HEAD` or a supported named ref such as `refs/heads/release`, `refs/tags/v1`, or `origin/main`. Full 40/64-character commit IDs and revision expressions such as `HEAD~1` are unsupported. The ref must resolve to a commit at worktree allocation; omitted values default to `HEAD` resolved at that time. Source-checkout cleanliness is still checked. For a workflow script, set it on the outer request as a default or on an individual `runs.run`/`runs.all` child to override it. |
-| `options.timeoutMs` | number | config `timeoutMs`, else 30 min foreground / single-agent async | Optional run-level max runtime in milliseconds. The top-level alias `maxRuntimeMs` is also accepted; both must agree. When omitted, the global [`timeoutMs`](configuration.md#timeoutms) config provides the default; absent that, foreground and plain single-agent async runs fall back to 30 minutes, while composite async runs (chains, parallel tasks, workflows) stay unbounded at the top level. Expiration of this run-level deadline is terminal. |
+| `options.timeoutMs` | number | config `timeoutMs`, else 30 min foreground / single-agent async | Optional run-level max runtime in milliseconds; time a child spends waiting for a supervisor reply (`contact_supervisor` decision or interview, `intercom` ask) does not count. The top-level alias `maxRuntimeMs` is also accepted; both must agree. When omitted, the global [`timeoutMs`](configuration.md#timeoutms) config provides the default; absent that, foreground and plain single-agent async runs fall back to 30 minutes, while composite async runs (chains, parallel tasks, workflows) stay unbounded at the top level. Expiration of this run-level deadline is terminal. |
 | `options.toolTimeoutMs` | number | fast-tool default | Optional positive hard per-tool-call deadline in milliseconds. Precedence: call value → agent frontmatter → config → `PI_SUBAGENT_TOOL_TIMEOUT_MS`. The timer starts on `tool_execution_start`, clears on the matching `tool_execution_end`, and terminates the run with `timedOut: true` if the tool remains open. When omitted, known-fast built-in tools get a five-minute default; long-running tools get attention notices but no hard default. It never extends the run deadline; `contact_supervisor`, `intercom`, and `bg_wait` are exempt. |
 | `options.checkpointBeforeDeadlineMs` | number | none | Async single-agent runs only. The runner requests that the child "checkpoint and stop" this many milliseconds before the run deadline (finish the current tool call, report changed files, build/test state, remaining work, commit/PR state; start no new work). This best-effort steer uses the normal steering lifecycle at the next tool boundary, so the receipt is visible in status and events; the ordinary deadline kill still applies. Precedence: call value → config `checkpointBeforeDeadlineMs`. Disarmed when the deadline leaves under one second before the checkpoint. |
 | `options.toolBudget` | object | none | Optional child tool-call budget `{ soft?, hard, block? }`: `hard` is a positive integer and `soft`, if set, is a positive integer no greater than `hard`. At `soft` the child is nudged to finalize. After `hard`, configured tools are blocked; `block` defaults to `read`, `grep`, `find`, and `ls`, and accepts either a nonempty array of tool names or `"*"` for every tool call. Final assistant text is never blocked. |
 | `options.usageBudget` | object | none | Optional root-only reported-usage budget `{ tokens?: { soft?, hard }, costUsd?: { soft?, hard } }`. Include at least one metric; each `hard` must be positive and each optional `soft` positive and no greater than its `hard`. Soft limits are status-only. Hard limits prevent later child launches after reported usage is reconciled; already-running children are not stopped and no reservations are made. |
-| `options.extensionBindings` | object | none | Child-only plain JSON keyed by namespaces like `package.name/1` (positive version): at most 16 namespaces, nesting depth 16, 256 total object properties, and 16 KiB of canonical UTF-8 JSON. Native Pi launches only; external runners and retained resumes reject it. |
+| `options.extensionBindings` | object | none | Child-only plain JSON keyed by namespaces like `package.name/1` (positive version): at most 16 namespaces, nesting depth 16, 256 total object properties, and 16 KiB of canonical UTF-8 JSON. Native Pi launches only; external runners and retained resumes reject it. A child's extensions read it as canonical JSON from `PI_SUBAGENT_EXTENSION_BINDINGS` in their factory or `session_start`; a foreground child sees it only until its session has started, after which the parent's environment is restored. |
 | `options.preflight` | object | none | Advisory lane hints for raw scripts (`workflow: true` or a script path) only; not accepted with named workflows or direct children. See [bounded workflows](workflows.md#opt-in-bounded-workflows). |
 | `cwd` | string | runtime cwd | Override working directory. With `machine`, the directory on that machine. |
-| `options.machine` | string | - | Herdr saved machine (label or profile id) for external-cli agents; see [agents.md](agents.md#running-external-cli-agents-on-a-herdr-saved-machine). |
+| `options.machine` | string | - | Herdr saved machine (label or profile id), a Rex host from settings, or `"local"` (a new tab in the Herdr or Rex session this Pi runs in); see [agents.md](agents.md#running-a-pi-child-in-a-new-tab-on-this-machine-rex-or-herdr). |
 | `options.maxOutput` | object | none | Final output truncation limits `{ bytes?, lines? }`. For child runs it is only applied when set; there is no default cap on the inline path, so use `outputMode: "file-only"` for large outputs. For workflow script results, the Return, Emitted, and Console sections are always capped, at 200 KB / 5000 lines unless `maxOutput` sets other limits. |
 | `options.artifacts` | boolean | true | Write debug artifacts. |
 | `options.includeProgress` | boolean | false | Include full progress in result. |
@@ -210,6 +211,7 @@ Agent definitions are not loaded into context by default. Management actions let
 { action: "list" }
 { action: "list", options: { agentScope: "project" } }
 { action: "list", options: { capabilities: true } }
+{ action: "list", options: { search: "review" } }
 { action: "get", agent: "scout" }
 { action: "models" }
 { action: "models", agent: "reviewer" }
@@ -252,6 +254,7 @@ Agent definitions are not loaded into context by default. Management actions let
 
 Rules:
 
+- `action: "list"` shows at most 30 agents, then a `+N more` line pointing at `options.search`; `details.agentCapabilities` still covers every match.
 - `options.capabilities: true` changes `action: "list"` to compact one-line rows and adds `details.agentCapabilities: { agents, restrictedCount, capabilityCeilingSources? }`. Each agent row includes source, aliases, runner type/capabilities, tools, MCP direct tools, mutation tools, model/thinking, default async/timeout, declared acceptance policy/role, output path/mode, skills/extensions, and whether the current capability ceiling allows execution. External CLI rows include `runner.command`, `runner.available`, and a bounded `runner.unavailableReason` when passive PATH/PATHEXT/X_OK lookup cannot find the command. It never includes an agent's system prompt. Rows show declared/default capabilities and command discoverability, not authentication, version compatibility, or successful launch; launch preflight remains authoritative.
 - `create` uses `config.scope`, not `agentScope`.
 - `config.name` is the local frontmatter name; optional `config.package` registers the runtime name as `{package}.{name}` and is saved as separate `name` and `package` frontmatter.
@@ -329,6 +332,7 @@ subagent({ action: "stop", id: "<run-id>" })
 subagent({ action: "resume", id: "<run-id>", message: "follow-up question after it pauses or finishes" })
 subagent({ action: "resume", id: "<run-id>", message: "follow-up for child 2", options: { index: 1 } })
 subagent({ action: "resume", id: "<nested-run-id>", message: "follow-up for a nested child" })
+subagent({ action: "resume", id: "<stopped-workflow-run-id>" })
 subagent({ action: "steer", id: "<run-id>", message: "guidance for the running child" })
 subagent({ action: "steer", id: "<run-id>", message: "check this after the current turn", options: { mode: "follow_up" } })
 subagent({ action: "steer", id: "<run-id>", message: "guidance for child 2", options: { index: 1, mode: "auto" } })
@@ -343,7 +347,7 @@ subagent({ action: "doctor" })
 - `view: "transcript"` tails the selected run's live `output-<index>.log` or persisted session transcript, with `lines` capped at 500.
 - Nested status shows the root/parent path, nested children, session/artifact paths when known, and nested control commands.
 - Inside child-safe fanout mode, bare `status` requires an id when no local foreground run is active, so children cannot enumerate unrelated top-level async runs.
-- Bare `interrupt` still targets only the visible top-level run; interrupting a nested run requires its explicit nested id.
+- `interrupt` requires an id, like `stop`, `steer`, and `resume`; for a nested run, pass its nested id.
 
 ### Command controls
 
@@ -379,6 +383,7 @@ Commands remain owned by the child session. Normal completion with unfinished co
 - Completed external-job runs, including nested runs, can use the same `resume` action as a provider follow-up when the registered provider exposes `followUp(input)`. Running external-job parents fail closed with guidance to wait for completion. Unsupported providers fail with an update/reload message.
 - Revive starts a new child session from the old session context; it does not resume the live session, and it requires the chosen child to have a persisted `.jsonl` session file.
 - Direct revival takes an exclusive cross-process lease on the canonical session file until the new child finishes. A concurrent attempt fails before Pi is spawned and identifies the owning revived run; dead-owner leases are reclaimed only when staleness can be proved.
+- Without `message` (and without `index` or `chain`), `resume` on a top-level async workflow run that stopped because its session was replaced or its Pi process exited (`workflow.stopCause: "runtime-replaced"` or `"owner-exited"`) relaunches it once from the launch it saved, reusing its finished children, and its receipt starts with `Resumed workflow '<id>' as <new id>.`; a run that cannot be resumed is refused as `Cannot resume workflow '<id>': <reason>.` The session that owns the run also resumes it on its own when reopened or reloaded, unless [`autoResume`](configuration.md#autoresume) is off; see [Workflows](workflows.md).
 
 ### stop
 
@@ -390,6 +395,7 @@ Commands remain owned by the child session. Normal completion with unfinished co
 - `/subagents-stop` without an id opens a selector with confirmation when a TUI is available. Use `↑`/`↓` or `j`/`k` to move through the selector. When two or more current-session async runs are active, the first row is "stop all", which stops each of them after one confirmation and leaves scheduled runs alone.
 - In non-TUI contexts the slash command prints exact `subagent({ action: "stop", id })` and `/subagents-stop <id>` commands.
 - Pass a child id to stop one child of a multi-child async run or workflow while the rest continue: `/subagents-stop <run-id> <child-id>` (equivalent to `subagent({ action: "stop", id, childId })`). Child ids come from status output, the async status snapshot, or `/subagents-inspect-rpc` replies. Only pending or running children are stoppable; the request is rejected for anything else instead of widening to a run-level stop.
+- `subagent({ action: "stop", id, options: { drain: true } })` stops a live async workflow in this session without killing running children: children that have not started are stopped, the script cannot start new children or `runs.host` commands, and children already running finish and keep their results. The workflow then ends as stopped and is never resumed. It cannot be combined with `childId`; a full `stop` still works during a drain.
 - Inactive schedules can appear in the selector, but they are labeled as schedules and route through `schedule.pause`, not `stop`.
 
 ### steer
@@ -536,6 +542,8 @@ async: true
 ```
 
 Supported: status artifacts, stdout/stderr logs, timeout, and stop. Full stdout and stderr are written to log files, while the in-memory final stdout response and stderr error are limited to their last 64 KiB.
+
+A code-owned adapter (`adapter: claude-code-writer` and the others in [agents.md](agents.md#claude-code-profiles)) records a `safety` block and a `safetySource: { measured: false, command }` beside it. The block is the adapter's profile, not a measurement, so a wrapper `command` that changes the CLI's argv can grant something else; see [Safety record and wrapper commands](agents.md#safety-record-and-wrapper-commands).
 
 Intentionally unsupported: native Pi child options such as model override, structured output, acceptance/agent contract, tool budgets, fast mode, fork context, skills, or native Pi tools unless the runner explicitly implements them. Foreground/clarify, steer/resume/interrupt-as-pause, and nested subagents are also unsupported.
 

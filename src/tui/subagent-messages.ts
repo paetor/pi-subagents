@@ -8,6 +8,7 @@ import { safeTerminalText } from "../shared/display-text.ts";
 import { formatWatchdogWarningRenderText, stateLabels } from "../watchdog/render.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE, WATCHDOG_WARNING_IMPORTANCES, WATCHDOG_WARNING_SEVERITIES, type WatchdogWarning } from "../watchdog/types.ts";
 import { normalizeWatchdogWarningDetails } from "../watchdog/warning-format.ts";
+import { waitToolName } from "../shared/wait-tool-name.ts";
 
 interface SubagentMessage {
 	customType: string;
@@ -148,8 +149,8 @@ function supervisorReminderHeadline(details: unknown, status: "unanswered" | "bl
 }
 
 function waitSubscriptionHeadline(details: unknown): Headline {
-	if (!isRecord(details) || typeof details.runId !== "string" || typeof details.outcome !== "string") return ["bg_wait fired"];
-	return [`bg_wait: run ${details.runId} `, { status: details.outcome }];
+	if (!isRecord(details) || typeof details.runId !== "string" || typeof details.outcome !== "string") return [`${waitToolName()} fired`];
+	return [`${waitToolName()}: run ${details.runId} `, { status: details.outcome }];
 }
 
 /** Workflow child notices saved before render details existed are read from their first line. */
@@ -211,6 +212,7 @@ const MESSAGE_VIEWS = new Map<string, (message: SubagentMessage) => BlockView>([
 	["subagent-wait-subscription", readsContent("result", (message) => waitSubscriptionHeadline(message.details))],
 	["subagent-incremental-child-notify", readsContent("result", workflowChildHeadline)],
 	["subagent-workflow-result-write-failed", readsContent("result", () => ["workflow result ", { status: "save failed" }])],
+	["subagent-auto-resume", readsContent("result", () => ["workflow auto-resume ", { status: "failed" }])],
 	[SUBAGENT_CONTROL_MESSAGE_TYPE, readsContent("attention", (message) => controlNoticeHeadline(message.details))],
 	[SUBAGENT_STEERING_MESSAGE_TYPE, readsContent("attention", (message) => steeringNoticeHeadline(message.details))],
 	[SUBAGENT_WATCHDOG_WARNING_TYPE, (message) => watchdogWarningView(message.details, contentText(message.content))],

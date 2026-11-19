@@ -55,6 +55,8 @@ function joinComma(values: string[] | undefined): string | undefined {
 
 interface SerializeAgentOptions {
 	preserveFrontmatterFields?: ReadonlySet<string>;
+	/** The caller set inheritGlobalContext on create; write it even when false, because an absent field takes settings defaults. */
+	explicitInheritGlobalContext?: boolean;
 }
 
 export function serializeAgent(config: AgentConfig, options: SerializeAgentOptions = {}): string {
@@ -91,12 +93,10 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 
 	if (config.model || preserve("model")) lines.push(`model: ${config.model ?? ""}`);
 	if (config.fast === true || preserve("fast")) lines.push(`fast: ${config.fast === undefined ? "" : config.fast ? "true" : "false"}`);
-	if ((config.thinking && (config.thinking !== "off" || preserve("thinking"))) || (!config.thinking && preserve("thinking"))) {
-		lines.push(`thinking: ${config.thinking ?? ""}`);
-	}
+	if (config.thinking || preserve("thinking")) lines.push(`thinking: ${config.thinking ?? ""}`);
 	if (!preservingExistingFrontmatter || preserve("systemPromptMode")) lines.push(`systemPromptMode: ${config.systemPromptMode}`);
 	if (!preservingExistingFrontmatter || preserve("inheritProjectContext")) lines.push(`inheritProjectContext: ${config.inheritProjectContext ? "true" : "false"}`);
-	if (config.inheritGlobalContext || preserve("inheritGlobalContext")) lines.push(`inheritGlobalContext: ${config.inheritGlobalContext ? "true" : "false"}`);
+	if (config.inheritGlobalContext || preserve("inheritGlobalContext") || options.explicitInheritGlobalContext) lines.push(`inheritGlobalContext: ${config.inheritGlobalContext ? "true" : "false"}`);
 	if (!preservingExistingFrontmatter || preserve("inheritSkills")) lines.push(`inheritSkills: ${config.inheritSkills ? "true" : "false"}`);
 	if (config.defaultContext || preserve("defaultContext")) lines.push(`defaultContext: ${config.defaultContext ?? ""}`);
 	if (config.runner || preserve("runner")) {

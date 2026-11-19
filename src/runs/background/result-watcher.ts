@@ -27,6 +27,7 @@ import { syncMissionFromAsyncCompletion } from "../../missions/lifecycle.ts";
 import { acknowledgeMissionObserverSnapshot, missionObserverIndexPath, missionObserverResultCandidateFiles, promotePendingResultFile, readResultPayload, resultCandidateFilesForSession, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, resultSnapshotReplaced, retireResultSnapshot, withResultRunLease, writeAsyncResultFile, writeResultIndexForData, type ResultSnapshot } from "./result-files.ts";
 import type { CompletionNotifier, CompletionNotification } from "./notify.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
+import { reportSessionWarning } from "../../shared/session-warnings.ts";
 
 const WATCHER_RESTART_DELAY_MS = 3000;
 const POLL_INTERVAL_MS = 3000;
@@ -66,7 +67,7 @@ type ResultWatcherDeps = {
 	resultScanLogging?: "all" | "activity" | "off";
 	platform?: NodeJS.Platform;
 	/** Shared current/predecessor session ownership used by the notifier. */
-	ownership?: Pick<ResultDeliveryOwnership, "owns" | "claimedSessionIds">;
+	ownership?: Pick<ResultDeliveryOwnership, "owns" | "claimedSessionIds" | "deliveryOwnerId">;
 	/** Called once the parent has this run's result: the notifier accepted it, or an earlier delivery already did. */
 	onResultDelivered?: (runId: string) => void;
 };
@@ -104,11 +105,15 @@ type ResultFileData = CompletionNotification & {
 	intercomTarget?: string;
 	parallelHandoff?: ParallelHandoffReference;
 	notificationDeliveredAt?: unknown;
+	completionOwnerProcess?: unknown;
+	parentWorkflowRunId?: unknown;
 };
 
 type ResultFileIdentity = {
 	sessionId?: string;
 	completionOwnerId?: string;
+	completionOwnerProcess?: unknown;
+	parentWorkflowRunId?: string;
 	runId?: string;
 };
 
@@ -118,36 +123,48 @@ interface ResultScanStats {
 	startedAt: number;
 }
 
-function jsonStringProperty(raw: string, property: string): string | undefined {
-	const matches = raw.matchAll(new RegExp(`"${property}"\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`, "g"));
+/** The last `"property": <value>` whose value matches `valuePattern`, parsed without reading the whole file; malformed reads as none. */
+function jsonPropertyValue(raw: string, property: string, valuePattern: string): unknown {
 	let encoded: string | undefined;
-	for (const match of matches) encoded = match[1];
+	for (const match of raw.matchAll(new RegExp(`"${property}"\\s*:\\s*(${valuePattern})`, "g"))) encoded = match[1];
 	if (!encoded) return undefined;
 	try {
-		const value = JSON.parse(encoded) as unknown;
-		return typeof value === "string" && value ? value : undefined;
+		return JSON.parse(encoded) as unknown;
 	} catch {
 		return undefined;
 	}
+}
+
+function jsonStringProperty(raw: string, property: string): string | undefined {
+	const value = jsonPropertyValue(raw, property, `"(?:\\\\.|[^"\\\\])*"`);
+	return typeof value === "string" && value ? value : undefined;
 }
 
 function resultFileIdentity(raw: string, file: string): ResultFileIdentity {
 	return {
 		sessionId: jsonStringProperty(raw, "sessionId"),
 		completionOwnerId: jsonStringProperty(raw, "completionOwnerId"),
+		// Recorded as a flat object, so a brace-free match is the whole value.
+		completionOwnerProcess: jsonPropertyValue(raw, "completionOwnerProcess", `\\{[^{}]*\\}`),
+		parentWorkflowRunId: jsonStringProperty(raw, "parentWorkflowRunId"),
 		runId: file.replace(/\.json$/i, ""),
 	};
 }
 
-function sanitizeNestedResultChildren(value: unknown, resultPath: string, label: string): NestedRunSummary[] | undefined {
+function reportResultWatcherWarning(state: SubagentState, message: string, error?: unknown, key = message): void {
+	const detail = error === undefined ? "" : `: ${error instanceof Error ? error.message : String(error)}`;
+	reportSessionWarning(state, `${message}${detail}`, key);
+}
+
+function sanitizeNestedResultChildren(state: SubagentState, value: unknown, resultPath: string, label: string): NestedRunSummary[] | undefined {
 	if (value === undefined) return undefined;
 	if (!Array.isArray(value)) {
-		console.error(`Ignoring invalid nested children in subagent result file '${resultPath}' at ${label}: expected an array.`);
+		reportResultWatcherWarning(state, `Ignoring invalid nested children in subagent result file '${resultPath}' at ${label}: expected an array.`);
 		return undefined;
 	}
 	const children = value.map((child) => sanitizeSummary(child)).filter((child): child is NestedRunSummary => Boolean(child));
 	if (children.length !== value.length) {
-		console.error(`Ignoring ${value.length - children.length} invalid nested child record(s) in subagent result file '${resultPath}' at ${label}.`);
+		reportResultWatcherWarning(state, `Ignoring ${value.length - children.length} invalid nested child record(s) in subagent result file '${resultPath}' at ${label}.`, undefined, `result-nested-records-invalid:${resultPath}:${label}`);
 	}
 	return children.length ? children : undefined;
 }
@@ -208,6 +225,7 @@ export function createResultWatcher(
 	transitionResultDelivery: () => void;
 	primeExistingResults: (options?: { triggerTurn?: boolean }) => void;
 	deliverPendingResults: () => Promise<void>;
+	hasPendingResults: () => boolean;
 	refreshResultDelivery: () => void;
 	stopResultWatcher: () => void;
 } {
@@ -222,6 +240,11 @@ export function createResultWatcher(
 	// While deliverPendingResults runs, completions skip the batch delay.
 	let deliveringPending = 0;
 	const identityCache = new Map<string, { signature: string; identity: ResultFileIdentity }>();
+	// Result file -> last logged mission-sync error. A failed sync is retried
+	// every pass, so the same error is logged once per result file.
+	const reportedMissionSyncFailures = new Map<string, string>();
+	// reportedMissionSyncFailures decides when to report; each report gets its own key so the session warning dedupe never hides it.
+	let missionSyncReports = 0;
 	let deliveryActive = true;
 	let deliveryEpoch = 0;
 	let resultScanTimer: ReturnType<typeof setInterval> | null = null;
@@ -233,6 +256,7 @@ export function createResultWatcher(
 			&& typeof completionOwnerId === "string"
 			&& completionOwnerId === state.completionOwnerId);
 	const claimedSessionIds = () => deps.ownership?.claimedSessionIds() ?? [];
+	const deliveryOwnerId: ResultDeliveryOwnership["deliveryOwnerId"] = deps.ownership?.deliveryOwnerId ?? ((_sessionId, completionOwnerId) => completionOwnerId);
 
 	const ownsCompletion = (sessionId: string, completionOwnerId: unknown, epoch: number) => {
 		if (!deliveryActive || epoch !== deliveryEpoch) return false;
@@ -251,7 +275,7 @@ export function createResultWatcher(
 		try {
 			return fsApi.statSync(publicResultPath(file)).isFile();
 		} catch (error) {
-			if (!isAbsentResultCandidate(error)) console.error(`Failed to inspect subagent result file '${publicResultPath(file)}':`, error);
+			if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${publicResultPath(file)}'`, error);
 			return false;
 		}
 	};
@@ -284,7 +308,7 @@ export function createResultWatcher(
 		} catch (error) {
 			identityCache.delete(file);
 			if (isAccessDenied(error)) throw error;
-			if (!isAbsentResultCandidate(error)) console.error(`Failed to inspect subagent result file '${resultPath}':`, error);
+			if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${resultPath}'`, error);
 			return undefined;
 		}
 	};
@@ -302,7 +326,7 @@ export function createResultWatcher(
 		} catch (error) {
 			identityCache.delete(file);
 			if (isAccessDenied(error)) throw error;
-			if (!isAbsentResultCandidate(error)) console.error(`Failed to inspect subagent result file '${resultPath}':`, error);
+			if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${resultPath}'`, error);
 			return undefined;
 		}
 	};
@@ -311,7 +335,7 @@ export function createResultWatcher(
 		try {
 			return new Set(deps.observedCompletionRunIds?.() ?? []);
 		} catch (error) {
-			console.error("Failed to inspect observed subagent completion ids:", error);
+			reportResultWatcherWarning(state, "Failed to inspect observed subagent completion ids", error);
 			return new Set();
 		}
 	};
@@ -323,7 +347,7 @@ export function createResultWatcher(
 		// Missing identity stays on the normal parser path so malformed or legacy
 		// files keep their existing diagnostics and compatibility behavior.
 		if (!identity.sessionId) return true;
-		if (ownsResult(identity.sessionId, identity.completionOwnerId)) return true;
+		if (ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) return true;
 		// Acknowledgment removes the observer index; gating on the mission binding instead
 		// re-ran mission sync for an unowned result on every scan.
 		if (identity.runId && fsApi.existsSync(missionObserverIndexPath(resultsDir, identity.runId))) return true;
@@ -337,7 +361,7 @@ export function createResultWatcher(
 			if (retireResultSnapshot(publicResultPath(file), read, undefined, CLEANUP_LEASE_WAIT_MS) === "replaced") scheduleResult(file, triggerTurn);
 		} catch (error) {
 			if (isAbsentResultCandidate(error)) return;
-			if (!(error instanceof FileLeaseBusyError)) console.error(`Failed to remove delivered subagent result '${publicResultPath(file)}'; will retry:`, error);
+			if (!(error instanceof FileLeaseBusyError)) reportResultWatcherWarning(state, `Failed to remove delivered subagent result '${publicResultPath(file)}'; will retry`, error);
 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 		}
 	};
@@ -352,7 +376,7 @@ export function createResultWatcher(
 			}
 		} catch (error) {
 			if (!isAccessDenied(error)) throw error;
-			console.error(`Failed to inspect subagent result file '${publicResultPath(file)}'; will retry:`, error);
+			reportResultWatcherWarning(state, `Failed to inspect subagent result file '${publicResultPath(file)}'; will retry`, error);
 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 			return;
 		}
@@ -393,7 +417,7 @@ export function createResultWatcher(
 			let data = parseResult(raw);
 			if (typeof data.sessionId !== "string" || !data.sessionId) return;
 			const sessionId = data.sessionId;
-			const completionOwnerId = data.completionOwnerId;
+			const completionOwnerId = deliveryOwnerId(sessionId, data.completionOwnerId, data.completionOwnerProcess, data.parentWorkflowRunId);
 			const runId = typeof data.runId === "string" && data.runId
 				? data.runId
 				: typeof data.id === "string" && data.id ? data.id : file.replace(/\.json$/i, "");
@@ -404,7 +428,7 @@ export function createResultWatcher(
 					if (!resultSnapshotReplaced(publicResultPath(file), read)) return false;
 				} catch (error) {
 					if (isAccessDenied(error)) throw error;
-					console.error(`Failed to re-read subagent result file '${publicResultPath(file)}':`, error);
+					reportResultWatcherWarning(state, `Failed to re-read subagent result file '${publicResultPath(file)}'`, error);
 				}
 				identityCache.delete(file);
 				rereadReplacedPayload = true;
@@ -413,22 +437,27 @@ export function createResultWatcher(
 			let observerSucceeded = true;
 			try {
 				syncMissionFromAsyncCompletion({ ...data, runId });
+				reportedMissionSyncFailures.delete(file);
 			} catch (error) {
 				observerSucceeded = false;
-				console.error(`Mission completion sync failed for '${resultPath}':`, error);
+				const message = error instanceof Error ? error.message : String(error);
+				if (reportedMissionSyncFailures.get(file) !== message) {
+					reportedMissionSyncFailures.set(file, message);
+					reportResultWatcherWarning(state, `Mission completion sync failed for '${resultPath}'`, error, `result-mission-sync-failed:${++missionSyncReports}`);
+				}
 			}
 			try {
 				deps.observeCompletion?.({ ...data, runId });
 			} catch (error) {
 				observerSucceeded = false;
-				console.error(`Completion observer failed for '${resultPath}':`, error);
+				reportResultWatcherWarning(state, `Completion observer failed for '${resultPath}'`, error);
 			}
 			if (observerSucceeded) {
 				try {
 					if (acknowledgeMissionObserverSnapshot(publicResultPath(file), read, CLEANUP_LEASE_WAIT_MS) === "replaced") rereadReplacedPayload = true;
 				} catch (error) {
 					observerSucceeded = false;
-					if (!(error instanceof FileLeaseBusyError)) console.error(`Failed to acknowledge the mission observer for '${resultPath}'; will retry:`, error);
+					if (!(error instanceof FileLeaseBusyError)) reportResultWatcherWarning(state, `Failed to acknowledge the mission observer for '${resultPath}'; will retry`, error);
 				}
 			}
 			const epoch = deliveryEpoch;
@@ -440,12 +469,12 @@ export function createResultWatcher(
 				sessionId,
 			});
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
-			let nestedChildren = compactNestedResultChildren(sanitizeNestedResultChildren(data.nestedChildren, resultPath, "nestedChildren"));
+			let nestedChildren = compactNestedResultChildren(sanitizeNestedResultChildren(state, data.nestedChildren, resultPath, "nestedChildren"));
 			if (!nestedChildren?.length && !hasExplicitNestedChildren) {
 				try {
 					nestedChildren = compactNestedResultChildren(projectNestedRegistryForRoot(runId)?.children);
 				} catch (error) {
-					console.error(`Failed to enrich subagent result file '${resultPath}' with nested registry children; will retry later:`, error);
+					reportResultWatcherWarning(state, `Failed to enrich subagent result file '${resultPath}' with nested registry children; will retry later`, error);
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
@@ -485,7 +514,7 @@ export function createResultWatcher(
 					? `${result.error}${hasRealOutput ? `\n\nOutput:\n${baseOutput}` : ""}`
 					: output;
 				const sessionPath = result.sessionFile ?? (resultChildren.length === 1 ? data.sessionFile : undefined);
-				const childNestedChildren = sanitizeNestedResultChildren(result.children, resultPath, `results[${index}].children`);
+				const childNestedChildren = sanitizeNestedResultChildren(state, result.children, resultPath, `results[${index}].children`);
 				const childState = result.state === "running" || result.state === "queued" || result.state === "paused" || result.state === "stopped"
 					? result.state
 					: result.stopped === true
@@ -552,13 +581,14 @@ export function createResultWatcher(
 					...(data.parallelHandoff ? { parallelHandoff: data.parallelHandoff } : {}),
 				}));
 				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
-				if (!intercomDelivered) console.error(`Subagent async grouped result intercom delivery was not acknowledged for '${resultPath}'.`);
+				if (!intercomDelivered) reportResultWatcherWarning(state, `Subagent async grouped result intercom delivery was not acknowledged for '${resultPath}'.`);
 			}
 
 			const delivery = notifier.deliver({
 				...data,
 				id: data.id ?? runId,
 				runId,
+				completionOwnerId,
 				triggerTurn,
 				intercomDelivered,
 				...(nestedChildren?.length ? { nestedChildren } : {}),
@@ -594,7 +624,7 @@ export function createResultWatcher(
 				}
 				({ data, read } = marked);
 			} catch (error) {
-				console.error(`Failed to mark subagent result notification delivered for '${resultPath}'; will retry:`, error);
+				reportResultWatcherWarning(state, `Failed to mark subagent result notification delivered for '${resultPath}'; will retry`, error);
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
@@ -620,7 +650,7 @@ export function createResultWatcher(
 					} : {}),
 				});
 			} catch (error) {
-				console.error(`Completion observer failed for '${resultPath}':`, error);
+				reportResultWatcherWarning(state, `Completion observer failed for '${resultPath}'`, error);
 			}
 			if (!observerSucceeded) {
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
@@ -634,9 +664,9 @@ export function createResultWatcher(
 			removeDeliveredResult(file, triggerTurn, read);
 		} catch (error) {
 			if (isAccessDenied(error)) {
-				console.error(`Failed to process subagent result file '${resultPath}'; will retry:`, error);
+				reportResultWatcherWarning(state, `Failed to process subagent result file '${resultPath}'; will retry`, error);
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
-			} else if (!isNotFound(error)) console.error(`Failed to process subagent result file '${resultPath}':`, error);
+			} else if (!isNotFound(error)) reportResultWatcherWarning(state, `Failed to process subagent result file '${resultPath}'`, error);
 		} finally {
 			processing.delete(file);
 			if (rereadReplacedPayload) scheduleResult(file, triggerTurn);
@@ -662,7 +692,7 @@ export function createResultWatcher(
 		// "activity", skip it so empty scans do not burn context tokens in the
 		// session transcript.
 		if (resultScanLogging === "activity" && stats.files === 0 && stats.scheduled === 0) return;
-		console.error(`Subagent result scan inspected ${stats.files} indexed result file(s), scheduled ${stats.scheduled} in ${elapsed}ms (${resultsDir}).`);
+		reportSessionWarning(state, `Subagent result scan inspected ${stats.files} indexed result file(s), scheduled ${stats.scheduled} in ${elapsed}ms (${resultsDir}).`, "slow-result-scan");
 	};
 	const indexedResultCandidates = (observed: ReadonlySet<string>): string[] => {
 		const files = new Set<string>();
@@ -690,10 +720,29 @@ export function createResultWatcher(
 			}
 			logScanStats(stats);
 		} catch (error) {
-			if (!isNotFound(error)) console.error(`Failed to scan subagent result index in '${resultsDir}':`, error);
+			if (!isNotFound(error)) reportResultWatcherWarning(state, `Failed to scan subagent result index in '${resultsDir}'`, error);
 		}
 		return files;
 	};
+	const hasPendingResults = () => eligibleResultFiles().some((file) => {
+		const payloadPath = resultPayloadPath(file);
+		if (!payloadPath) return false;
+		let raw: string;
+		try {
+			raw = fsApi.readFileSync(payloadPath, "utf-8");
+		} catch (error) {
+			// Removed since the scan means delivered; an unreadable file is still owed to someone, so the switch asks.
+			return !isNotFound(error);
+		}
+		const identity = resultFileIdentity(raw, file);
+		if (!identity.sessionId || !ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) return false;
+		try {
+			return !hasDeliveredNotification(parseResult(raw));
+		} catch {
+			// A partial write is retried by the watcher; until then it counts as undelivered.
+			return true;
+		}
+	});
 	const primeExistingResults = (options: { triggerTurn?: boolean } = {}) => {
 		const triggerTurn = options.triggerTurn !== false;
 		for (const file of eligibleResultFiles()) scheduleResult(file, triggerTurn);
@@ -723,7 +772,7 @@ export function createResultWatcher(
 		try {
 			return deps.hasDeliveryDemand?.() === true;
 		} catch (error) {
-			console.error("Failed to inspect subagent result delivery demand:", error);
+			reportResultWatcherWarning(state, "Failed to inspect subagent result delivery demand", error);
 			return false;
 		}
 	};
@@ -748,7 +797,7 @@ export function createResultWatcher(
 		state.watcher = null;
 		clearResultScan();
 		if (state.watcherRestartTimer) return;
-		console.error(`Subagent result watcher for '${resultsDir}' fell back to polling because native fs.watch is unavailable (${errorCode(reason) ?? "unknown error"}).`);
+		reportResultWatcherWarning(state, `Subagent result watcher for '${resultsDir}' fell back to polling because native fs.watch is unavailable (${errorCode(reason) ?? "unknown error"}).`, undefined, `result-poll-fallback:${resultsDir}`);
 		primeExistingResults();
 		state.watcherRestartTimer = timers.setInterval(primeExistingResults, POLL_INTERVAL_MS);
 		state.watcherRestartTimer.unref?.();
@@ -764,7 +813,7 @@ export function createResultWatcher(
 				startResultWatcher();
 			} catch (error) {
 				if (shouldPoll(error)) return startPolling(error);
-				console.error(`Failed to restart subagent result watcher for '${resultsDir}':`, error);
+				reportResultWatcherWarning(state, `Failed to restart subagent result watcher for '${resultsDir}'`, error);
 				scheduleRestart();
 			}
 		}, WATCHER_RESTART_DELAY_MS);
@@ -805,7 +854,7 @@ export function createResultWatcher(
 			});
 			state.watcher.on("error", (error) => {
 				if (shouldPoll(error)) return startPolling(error);
-				console.error(`Subagent result watcher failed for '${resultsDir}':`, error);
+				reportResultWatcherWarning(state, `Subagent result watcher failed for '${resultsDir}'`, error);
 				state.watcher?.close();
 				state.watcher = null;
 				scheduleRestart();
@@ -815,7 +864,7 @@ export function createResultWatcher(
 			resultScanTimer.unref?.();
 		} catch (error) {
 			if (shouldPoll(error)) return startPolling(error);
-			console.error(`Failed to start subagent result watcher for '${resultsDir}':`, error);
+			reportResultWatcherWarning(state, `Failed to start subagent result watcher for '${resultsDir}'`, error);
 			state.watcher = null;
 			scheduleRestart();
 		}
@@ -842,5 +891,5 @@ export function createResultWatcher(
 		identityCache.clear();
 	};
 
-	return { startResultWatcher, transitionResultDelivery, primeExistingResults, deliverPendingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
+	return { startResultWatcher, transitionResultDelivery, primeExistingResults, deliverPendingResults, hasPendingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
 }

@@ -43,7 +43,7 @@ Builtins load at the lowest priority, so a user or project agent with the same n
 | `researcher` | Web/docs research with sources: official docs, specs, benchmarks, recent changes, and a concise research brief. |
 | `evidence-auditor` | Independent evidence review of important claims in an existing research brief. |
 | `worker` | Implementation work, including approved oracle handoffs. It edits files, validates, and escalates unapproved decisions instead of guessing. |
-| `reviewer` | Code review and small fixes. It checks the implementation against the task/plan, tests, edge cases, and simplicity. |
+| `reviewer` | Read-only code review. It checks the implementation against the task/plan, tests, edge cases, and simplicity. |
 | `oracle` | A second opinion before acting. It challenges assumptions, catches drift, and recommends the safest next move without editing. |
 | `delegate` | A lightweight general delegate when you want a child agent that behaves close to the parent session. |
 
@@ -194,6 +194,12 @@ node --experimental-strip-types --import ./test/support/register-loader.mjs \
 
 The read-only smoke must report `writeCanaryExists: false`. The writer smoke must report `writeCanaryMatches: true`. Both reports record `workspaceTrust: "operator-managed-saved"`, confirm that the external prompt root was added, and include startup duration and terminal proof without raw protocol output, prompts, or credentials. A trust-required error remains terminal; the harness does not retry with a trust, force, or yolo flag.
 
+#### Safety record and wrapper commands
+
+Each code-owned adapter run records a `safety` block in its runner status, in `subagent({ action: "status" })`, and in its workflow receipt entry. The block is the adapter's profile: the access its own argv asks the CLI for. Nothing in it is measured from the launched process, and status labels it `Safety (adapter profile, not measured)`.
+
+The record carries `safetySource: { "measured": false, "command": "..." }` beside it. `command` is the launch command as configured; a run on a Herdr saved machine records none, because the remote pane runs the adapter's own binary. When `runner.command` is a wrapper script that changes argv before it starts the CLI, the wrapper can grant more or less than the profile shows, so read the wrapper to know the real grant. Receipts written before `safetySource` existed are read as profile values.
+
 #### Native oracle compared with external advisors
 
 Native `oracle` runs inside Pi and can use its configured read tools. The Claude profiles send the assembled prompt to the local Claude Code CLI through stdin. An external-job agent sends the assembled prompt to its registered provider. Provider options and a prompt digest are persisted in Pi run state. The prompt text is delivered through the local host bridge to the provider and is not stored in the public result payload. Do not place secrets in advisory prompts unless the target provider is approved to receive them.
@@ -244,7 +250,7 @@ Supported override fields: `description`, `advertise`, `machine`, `output`, `out
 - `description` replaces the discovered description for builtin and custom agents, which lets list output show deployment-specific routing or model metadata.
 - Use `output: false`, `defaultReads: false`, `defaultContext: false`, `acceptanceRole: false`, or `machine: false` to clear an inherited value.
 - Use `tools: "inherit"` when that one role should omit its bundled or frontmatter tool allowlist and receive Pi's normal builtins (plus ambient extensions when it runs as a background child).
-- Project overrides beat user overrides.
+- Project overrides beat user overrides field by field: a project override replaces only the fields it sets, and fields set only in the user override still apply.
 - Matching package, user, and project agents also receive override fields, which replace the same fields declared in their frontmatter. This lets a shared agent keep its persona while local settings choose the effective model, context, tools, or other supported options.
 
 Disable and restore:
@@ -262,6 +268,8 @@ A custom agent file that shadows a bundled agent replaces the bundled definition
 ## Running external CLI agents on a Herdr saved machine
 
 Native Pi and the six code-owned Claude Code, Codex, and Cursor profiles can run on a Herdr machine (`herdr machine add <target> --label <name>`). Herdr owns each visible agent process in a fresh no-focus pane; SSH is used only as bounded transport for Herdr RPC and ownership checks. Herdr's catalog is the host allowlist; raw ssh targets are rejected.
+
+For a pane on this machine you don't need a saved machine: run Pi inside Herdr and use `machine: "local"`. This means the herdr terminal multiplexer; terminals of Herdr Core (`hc`, the Herdr app's terminal server) are not supported.
 
 `machine` is a top-level frontmatter key, a settings override (`subagents.agentOverrides.<agent>.machine`, project beats user, `false` clears a pin), and a launch option on the `subagent` tool, workflow `runs.run`, chain, parallel, and dynamic-fanout steps. The launch option wins. Placement survives `subagent({ action: "disable" })`, `reset`, and model profile switches.
 
@@ -281,6 +289,38 @@ Native Pi and the six code-owned Claude Code, Codex, and Cursor profiles can run
 Placed external profiles are one-shot and stop-only: they cannot steer, resume, or claim a Pi supervisor. Their result is always `partial` and begins `[best-effort/unverified]`, because only bounded sanitized terminal snapshots are exposed; no vendor-private transcript, database, JSONL, or blob is used as authoritative settlement evidence. Reconnect observes the same pane and process without redispatching the prompt.
 
 pi-subagents never clones, pulls, or checks out on the machine. Generic `external-cli` commands and managed worktrees are rejected before launch; saved-machine placement accepts native Pi and only the six code-owned external profiles.
+
+## Running a Pi child in a new tab on this machine (Rex or Herdr)
+
+`machine: "local"` runs a native Pi child as a visible Pi in a new background tab of the terminal this Pi runs in, labeled `subagent-<run id tail>`. Inside Rex, that is a tab in your Rex session. Inside a Herdr pane (`HERDR_ENV=1` and `HERDR_PANE_ID` set), it is a tab in your own Herdr session, reached over the local Herdr socket with no saved machine and no SSH. When both are set (Herdr running inside a Rex tab), Herdr wins, because the Herdr pane is where Pi is drawn. Outside both, or when the Rex or Herdr server does not confirm this Pi's session or pane, the launch fails before anything starts. `local` is reserved and never looks in the Herdr catalog. It works wherever `machine` works: frontmatter, settings overrides, the `subagent` tool, workflow `runs.run`, chain, parallel, and dynamic-fanout steps.
+
+The parent drives the child through the same bridge as a Herdr-placed Pi: prompt, steer, follow-up, abort, `contact_supervisor`, and results. The child Pi loads pi-subagents from its own extensions, so it must be installed at the same version. `cwd` is a directory on this machine; a relative path joins the launch directory. In Herdr, the tab opens in the `pi-subagents-…` workspace pi-subagents made for that directory if there is one, else in the one workspace with a pane in that directory, else in a new no-focus `pi-subagents-…` workspace. In Rex, pi-subagents finds `rex` in `$REX_BIN_DIR`, then on `PATH`, then in the Rex server app; in Herdr, it runs `herdr` from `$HERDR_BIN` or `PATH`.
+
+A finished child keeps its tab open, with the idle Pi, until you close it; an aborted or stopped child's tab is closed. Limits: native Pi only (Claude Code, Codex, Cursor, and generic `external-cli` agents are rejected), fresh context only, and the same restrictions as a Herdr-placed Pi (no local extension paths, process environment, nested delegation, permission rules, tool budgets, or `outputSchema`).
+
+A `local` child edits this machine's disk, so in either terminal it gets the same local cwd check, Git evidence and output-file handling as a child without `machine`.
+
+## Running a Pi child in a Rex pane on another Mac
+
+Name a Mac you reach over SSH in your user settings (`~/.pi/agent/settings.json`), with its repo root:
+
+```json
+{
+  "subagents": {
+    "machines": {
+      "workmac": { "rex": { "ssh": "100.82.67.118" }, "cwd": "~/dev/app" }
+    }
+  }
+}
+```
+
+`machine: "workmac"` then runs a native Pi child as a visible Pi in a new background tab of the Rex session labeled `subagents` on that Mac. pi-subagents creates the session the first time and reuses it after that; if two sessions there have that label, the launch fails until you close or rename one. Every `rex` command runs on that Mac over SSH, and the bridge socket comes back through an SSH forward, so SSH must work without a prompt (`ssh <target>` once to accept the host key). A name with a `rex` entry never looks in the Herdr catalog, so Herdr does not need to be installed.
+
+Only user settings may name a Rex host: a `rex` entry in a project's `.pi/settings.json` fails the launch, so a cloned repo cannot choose where a task runs. `cwd` can come from project or user settings, as for Herdr machines: a relative step `cwd` joins it, and an absolute or `~` path is used as given. The other Mac needs Rex, Pi on its login shell's `PATH`, and pi-subagents installed at the same version. The child edits that Mac's disk, so its changed files come from that Mac's Git state, as for a Herdr-placed child.
+
+Programs in a Rex tab run under the Rex app's macOS privacy permissions. If Pi on that Mac reads files in Desktop, Documents, or Downloads (for example a package path in its settings), allow Rex there first: open a Rex tab on that Mac, run `ls ~/Documents`, and accept the prompt. Until then Pi waits on the prompt and the launch times out.
+
+To watch the tab, open the `subagents` session in Rex on that Mac. To watch it from this Mac, add that Mac's Rex server to your hosts here once (`rex hosts add workmac <endpoint>`; after `rex server tailscale on` there, `rex whoami` on that Mac shows its Tailscale address). Tab lifecycle and limits are the same as for `machine: "local"`.
 
 ## Sandboxing background children with a launcher
 
@@ -303,9 +343,10 @@ How it behaves:
 - **Not combined with other placement.** `launcher` cannot be combined with `machine` (from frontmatter, a settings override, or the call) or with an `external-cli` or `external-job` runner.
 - **Unknown names fail.** If the name is not in `runnerLaunchers`, the launch fails before anything starts, without using a fan-out slot or creating a session directory. It never falls back to running without the launcher.
 - **Status.** The run's `status.json` records `launcher: { name, argv }`. Environment values are never recorded.
-- **Resume and revival.** A resumed run uses the launcher recorded when the run was first launched, not the agent file's current value, and looks up that name's argv in the config the session loaded, like a new launch does; edits to `runnerLaunchers` apply after `/reload`. A run launched without a launcher stays unwrapped even if its agent file gains `launcher` later. If the recorded name is no longer in `runnerLaunchers`, the resume fails before anything starts, and the run can be resumed once the name is defined again.
+- **Resume and revival.** A resumed run uses the launcher recorded when the run was first launched, not the agent file's current value, and looks up that name's argv in the config the session loaded, like a new launch does; edits to `runnerLaunchers` apply after `/reload`. A run recorded as launched without a launcher stays unwrapped even if its agent file gains `launcher` later. When no launcher choice is recorded (a run started before this was recorded, a foreground run, or a workflow child resumed through its workflow run), the resume uses the agent file's current `launcher`, so it never runs unwrapped just because the record is missing. If the recorded name is no longer in `runnerLaunchers`, the resume fails before anything starts, and the run can be resumed once the name is defined again.
 - **Several agents in one runner.** A new chain attached to a running subagent, or steps appended to a running chain, run in one background runner. All agents in it must name the same launcher, or none; a mix is refused before anything starts, and the error names each agent and its launcher. Appended steps must also match the launcher of the runner they join. Steps in one wrapped chain share its sandbox; to give branches different sandboxes, run them as workflow-script children, which each get their own runner.
 - **Agent management.** `subagent({ action: "create" })` and `update` cannot set `launcher`; edit the agent file instead. Other updates keep an existing `launcher` line.
+- **Requiring a launcher from the call.** `options.requireLauncher: { name, definitionDigest }` refuses a launch unless it runs under that launcher with that agent definition. See [Requiring a launcher](extension-api.md#requiring-a-launcher).
 
 ### Wrapper requirements
 
@@ -318,11 +359,25 @@ A launcher command must:
 
 Steering, stop, and supervisor requests and replies travel through files in those directories, not through signals, so they work as long as the paths are shared.
 
+With `~/.pi/agent` read-only, a child cannot refresh an OAuth login, because Pi locks and rewrites `auth.json` there, so it fails once its token needs a refresh; API keys are unaffected. Child sessions sit under `~/.pi/agent/sessions/` by default, so the child session directory still needs its own read-write binding.
+
+### Isolating a run from the parent
+
+A launcher can also keep a run from reaching the parent session and other runs. Resume and auto-resume take what to relaunch and under which identity only from records the parent keeps in `async-subagent-launches/<id>/` under the temp root: a workflow's saved launch (its script, owning session and capability ceiling), and a single run's recovery descriptor (its agent, session file, cwd, model, tools, ceilings and launcher). A run that rewrites files in its own run directory, such as `status.json`, cannot make a later resume start something else or continue another run's transcript. For the isolation to hold, the launcher must not give the run write access to:
+
+- `async-subagent-launches/`, or other runs' directories under `async-subagent-runs/`;
+- `~/.pi/agent`: extensions, settings and agent files there load into the parent session, so write access to them is a way into the parent. Bind it read-only.
+
+The run's working directory stays writable, so a run can still reach the parent through it: the project's `.pi/` extensions and agents, or `.git/config` settings such as `core.fsmonitor` that the parent's git commands run. Give an isolated run a checkout the parent session does not use.
+
+Runs that a child starts itself (nested runs) keep these records in their root run's folder under `nested-subagent-runs/`. The child's runner writes them, so they add no isolation.
+
 ### Broker wrappers
 
 Some sandboxes, such as nono's broker mode, start the runner in a separate process instead of as a child of the launcher command. pi-subagents does not rely on the launcher's process being the runner:
 
 - Before it starts any work, the runner reports its own process id. The launch waits up to 10 seconds for it and fails if it does not arrive. `status.json` and run events use the runner's process id, not the launcher's.
+- If the launch fails before the runner is told to proceed, pi-subagents stops the reported process only when it is the launcher's process or one of its descendants, so a runner cannot make the parent signal an unrelated process. A broker-started runner is not signalled; it exits by itself within 30 seconds when it is never told to proceed.
 - When the launcher process exits, its exit code and signal are kept in `launcher-close.json` in the run directory. That exit is treated as the runner's exit only when the runner's process is confirmed dead. A runner killed by a signal may be reported by the launcher as exit code `128 + n` (for example `143` for `SIGTERM`).
 - If only the launcher process is killed while the runner keeps working, the run keeps running and still accepts steer and stop. No process-exit proof is recorded when the runner later exits, so if `maxActiveAsyncRunsPerSession` is set, the run's capacity slot stays held; the abandoned-slot policy releases it only if the run ends failed.
 - If the sandbox does not let the parent check the runner's process id, a runner that dies without its launcher noticing stays `running` until the stale-run check marks it failed after 24 hours without a status update.
@@ -353,11 +408,11 @@ Use these fields when an agent should see more:
 |-------|--------|
 | `systemPromptMode: append` | Append the agent prompt to Pi's normal base prompt. |
 | `inheritProjectContext: true` | Keep inherited repository instructions from files like `AGENTS.md` and `CLAUDE.md`. |
-| `inheritGlobalContext: true` | Also keep the operator's global context file from the Pi config agent directory (such as `~/.pi/agent/AGENTS.md`). Defaults to `false`. |
+| `inheritGlobalContext: true` | Also keep the operator's global context file from the Pi config agent directory (such as `~/.pi/agent/AGENTS.md`). Defaults to `false`, or to `subagents.defaultInheritGlobalContext` when that is set. |
 | `inheritSkills: true` | Let the child see Pi's discovered skills catalog. |
 | `defaultContext: fork` | Prefer forked session context when a launch omits `context`; if the parent has no persisted session file or current leaf yet, the implicit default falls back to `fresh` without a failed first attempt. Explicit `context: "fork"` remains strict, and explicit `context: "fresh"` still wins. |
 
-Builtin agents opt into repository instruction inheritance by default so they follow repo-specific rules out of the box, but global context remains excluded unless `inheritGlobalContext: true` is set. This changes the behavior of existing agents that previously received global context as part of `inheritProjectContext: true`. `delegate` also uses append mode because its job is orchestration inside the parent workflow.
+Builtin agents opt into repository instruction inheritance by default so they follow repo-specific rules out of the box, but global context remains excluded unless `inheritGlobalContext: true` is set, per agent or for every agent with `subagents.defaultInheritGlobalContext: true` (see [models.md](models.md#global-context-default)). This changes the behavior of existing agents that previously received global context as part of `inheritProjectContext: true`. `delegate` also uses append mode because its job is orchestration inside the parent workflow.
 
 These fields and `systemPromptMode` shape a fresh child's system prompt. A forked child (`context: "fork"`) sends its parent's whole system prompt instead, project context, global context, and skills included, and gets its agent prompt in its task message (see [fork context details](tool-reference.md#fork-context-details)).
 
@@ -427,7 +482,7 @@ Field notes:
 | `thinking` | Appended as a `:level` suffix at runtime unless a suffix is already present. On the two Claude Code adapters it becomes `--effort`, and a suffix on `model` wins over it. |
 | `systemPromptMode` | `replace` by default; `append` keeps Pi's base prompt. |
 | `inheritProjectContext` | Keeps or strips inherited repository instruction blocks. |
-| `inheritGlobalContext` | Keeps or strips the operator's global context file from the Pi config agent directory (e.g. `~/.pi/agent/AGENTS.md`). It has an effect only when `inheritProjectContext` is `true`; otherwise all context files are already disabled. Defaults to `false`. |
+| `inheritGlobalContext` | Keeps or strips the operator's global context file from the Pi config agent directory (e.g. `~/.pi/agent/AGENTS.md`). It has an effect only when `inheritProjectContext` is `true`; otherwise all context files are already disabled. |
 | `inheritSkills` | Keeps or strips Pi's discovered skills catalog. For in-process children this includes skills that loaded extensions add; herdr-placed children rely on Pi's `--no-skills`. |
 | `defaultContext` | Optional `fresh` or `fork` launch-context preference. An implicit `fork` falls back to `fresh` when the parent has no persisted session file or current leaf; an explicit launch `context: "fork"` remains strict. |
 | `skills` | Selects specific skills for the child, regardless of `inheritSkills`. |
@@ -512,12 +567,15 @@ How `tools` behaves:
 - `tools` omitted: the child session gets Pi's normal builtin tools.
 - `tools` present: regular tool names become an explicit allowlist.
 - `tools:` empty: the child session gets no tools.
+- `tools: +codemode` or `tools: -write`: rejected. Pi's `--tools` and `defaultTools` accept `+name`/`-name` entries that edit the default tool set, but a child's `tools` list replaces that set, so name every tool the child needs, or omit `tools` and use `excludeTools` to drop one. A local agent with such an entry fails before launch. A Herdr- or Rex-placed child resolves its agent on that machine, so an entry only there fails when the pane bridge is configured, before the first prompt.
 - `allowNestedSubagents: true`: explicitly enables child-safe nested fanout without turning omitted `tools` into an allowlist. Depth and inherited capability ceilings still apply.
 - `allowedAgents: scout, reviewer`: if nesting is separately enabled, restricts this agent's descendant launches to those names. `allowedAgents:` denies all descendants and omission is unrestricted except for inherited/runtime policy.
 
 `excludeTools` is applied after this resolution. It can narrow an explicit `tools` allowlist or, when `tools` is omitted, remove names from Pi's default builtin tool set. Runtime-injected tools are excluded only when their exact names are listed. An empty `excludeTools` list has no effect.
 
 An allowlisted name does not load the extension that registers it. Load that provider through `extensions`, `subagentOnlyExtensions`, a path-like `tools` entry, or (background children only) normal Pi extension discovery. Pi's built-in `codemode` is the exception: native children register the host SDK's official factory when codemode is permitted, without enabling it in the main session. On older Pi hosts without that factory, a child that requests codemode still reports it as unavailable; a capability ceiling that denies extensions prevents its registration.
+
+An extension loaded in the child can also replace the tools sent to the model, as pi-fabric's code mode does when it offers only `fabric_exec`. A child with a `tools` allowlist then fails before its first model request, and the error names the active allowlisted tools the request left out. Set `extensions: []` or list only the extensions the child needs, or omit `tools` to use that extension's tool surface. An allowlisted tool that an extension keeps inactive, such as pi-web-access's `web_enable` loader, can be left out of a request without failing the child.
 
 Ambient extensions depend on where the child runs. Local foreground children are sessions inside the parent Pi process and never load the parent's ambient extensions; otherwise the parent would start a second copy of each ambient extension, including this one. Background children are sessions inside the detached runner process and load the ambient extensions unless the agent sets `extensions` or the capability ceiling denies extensions. Local foreground children do inherit the providers the parent's extensions registered (`pi.registerProvider`), so their models resolve without loading those extensions again. The child gets the provider but not the registering extension's session hooks, so a provider that relies on its own hooks (for example to record each session's system prompt) can fail the child's first request; the foreground error then says so. Use `async: true` or list that extension in the agent's `subagentOnlyExtensions` or `extensions`. Pane-native remote foreground children instead use the remote machine's provider discovery and configuration. Agents that need MCP tools from an ambient adapter such as pi-mcp-adapter (including `mcp:` entries the adapter resolves) must therefore run as background children (`async: true`). A foreground launch of such an agent fails with a diagnostic that says exactly that.
 
@@ -539,9 +597,11 @@ Examples:
 
 ### MCP tools
 
-When [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) is not installed and Pi has built-in MCP (Pi 0.99.2 or later), `mcp:server` and `mcp:server/tool` entries resolve against Pi's built-in MCP. Name the server and tool as the server reports them: `mcp:my-docs/get-item` selects the tool Pi registers as `mcp__my_docs__get_item`. The server part may also use the `-`→`_` form of its name that Pi's MCP namespace uses, such as `mcp:my_docs`. The child connects the servers in Pi's `mcp.json` (the project's `.pi/mcp.json` only when the parent trusts the project) and gets only the selected tools, as direct tools, whatever exposure the server is configured with; tools configured as `hidden` cannot be selected. Servers that an extension adds with `pi.registerMcpServer()` work in background children, because the registering extension loads there too. They do not work in foreground children, which load no ambient extensions, so a foreground launch that selects one fails and says to use `async: true`. The child waits for the selected servers' current MCP connection attempts before its first prompt, then rejects the launch if any selected tool is missing or not available as a direct tool. Pi's MCP request timeout still bounds each connection; stopping, interrupting, timing out, or shutting down the child cancels the startup wait. An unrelated server does not delay this check.
+When [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) is not installed, `mcp:server` and `mcp:server/tool` entries resolve against Pi's built-in MCP. Name the server and tool as the server reports them: `mcp:my-docs/get-item` selects the tool Pi registers as `mcp__my_docs__get_item`. The server part may also use the `-`→`_` form of its name that Pi's MCP namespace uses, such as `mcp:my_docs`. The child connects the servers in Pi's `mcp.json` (the project's `.pi/mcp.json` only when the parent trusts the project) and gets only the selected tools, as direct tools, whatever exposure the server is configured with; tools configured as `hidden` cannot be selected. Servers that an extension adds with `pi.registerMcpServer()` work in background children, because the registering extension loads there too. Foreground children load no ambient extensions, so they get only the servers their required child extensions (see Required host extensions) register, and a foreground launch that selects a server from any other extension fails and says to use `async: true`. The child waits for the selected servers' current MCP connection attempts before its first prompt, then rejects the launch if any selected tool is missing or not available as a direct tool. Pi's MCP request timeout still bounds each connection; stopping, interrupting, timing out, or shutting down the child cancels the startup wait. An unrelated server does not delay this check.
 
-When pi-mcp-adapter is installed, it keeps priority and provides the direct MCP tools. Subagents only receive direct MCP tools when `mcp:` entries are listed in their frontmatter; global `directTools: true` in the adapter's MCP config is not enough by itself. The generic `mcp` proxy tool can still be used for discovery when available. The adapter caches tool metadata at startup, so after connecting a new MCP server for the first time, restart Pi before relying on direct tools. Server `includeTools` and `excludeTools` policies are enforced while resolving cached metadata for children: both accept exact names and `*`/`?` glob patterns against raw, generated-resource, and server/short/mcp/none-prefixed names, with `excludeTools` taking precedence. `mcp:` entries must name servers from the adapter's configuration files. A server that exists only in the adapter's runtime snapshot (registered at runtime, not persisted) cannot be provided to a child: children are pi sessions inside the parent or the runner process, not `pi` processes that could receive an MCP config argument, so such a launch fails with an error saying that MCP tools must come from an ambient adapter extension in a background child. An `mcp:` entry named `subagent` does not authorize nested fanout; declare the builtin `subagent` tool or set `allowNestedSubagents: true`. If a resolved direct MCP name is missing from the child registry, pi-subagents keeps the launch failed under the strict allowlist and reports the registration mismatch; check the resolved names against what the host or pi-mcp-adapter actually registers before child startup.
+When pi-mcp-adapter is installed, it keeps priority and provides the direct MCP tools. A background child with omitted `tools` and no capability ceiling uses the adapter's configured direct tools, including `directTools: true`. This also applies to agents that set only `excludeTools`: the child loads the configured tools, then excludes the listed names.
+
+With an explicit `tools` allowlist, include `mcp:` entries for the direct MCP tools the child needs. A capability ceiling continues to restrict the child's MCP selections. The generic `mcp` proxy tool can still be used for discovery when available. The adapter caches tool metadata at startup, so after connecting a new MCP server for the first time, restart Pi before relying on direct tools. Selectors for servers explicitly configured with `disabled: true` are skipped; unknown servers and enabled servers without matching cached tools still fail the launch. Server `includeTools` and `excludeTools` policies are enforced while resolving cached metadata for children: both accept exact names and `*`/`?` glob patterns against raw, generated-resource, and server/short/mcp/none-prefixed names, with `excludeTools` taking precedence. `mcp:` entries must name servers from the adapter's configuration files. A server that exists only in the adapter's runtime snapshot (registered at runtime, not persisted) cannot be provided to a child: children are pi sessions inside the parent or the runner process, not `pi` processes that could receive an MCP config argument, so such a launch fails with an error saying that MCP tools must come from an ambient adapter extension in a background child. An `mcp:` entry named `subagent` does not authorize nested fanout; declare the builtin `subagent` tool or set `allowNestedSubagents: true`. If a resolved direct MCP name is missing from the child registry, pi-subagents keeps the launch failed under the strict allowlist and reports the registration mismatch; check the resolved names against what the host or pi-mcp-adapter actually registers before child startup.
 
 ### Extension loading
 
@@ -619,11 +679,10 @@ The package bundles a `pi-subagents` skill that is automatically available to th
 
 What it covers:
 
-- **Delegation patterns**: how to select a bounded agent and single, parallel, scripted, or async shape after delegation is authorized, including fresh or forked context.
-- **Prompt workflow recipes**: how to apply the packaged techniques directly with `subagent(...)` when the user describes the workflow in natural language instead of invoking a slash command. This includes parallel review, review-loop, parallel research, parallel context-build, parallel handoff-plan, gather-context-and-clarify, and parallel cleanup.
-- **Role-agent prompting guidance**: compact contract prompts instead of long scripts, what to include in role-specific meta prompts, and retrieval budgets for researchers.
-- **Safety boundaries**: child agents must not run subagents unless their resolved builtin tools explicitly include `subagent`, must not invent intercom targets, and must escalate unapproved decisions.
-- **Intercom conventions**: when to ask vs send, and how parent-side supervisor/result delivery works through the native channel.
-- **Control and diagnostics**: attention signals, soft interrupts, status, and the `doctor` action.
+- **Calls**: the common `subagent` calls, workflow script and resume shapes, and async waiting rules.
+- **Delegation rules**: when to delegate at all, what every child brief contains, one writer per worktree, fresh or forked context, and what to do when a lane fails.
+- **Prompt workflow recipes**: how to apply the packaged techniques directly with `subagent(...)` when the user describes the workflow in natural language instead of invoking a slash command: parallel review, review loop, parallel research, gather-context-and-clarify, parallel cleanup, and oracle consultation.
+- **Orchestration**: splitting work into lanes, review loops, finding disposition, and gate-failure triage.
+- **Lookups**: which `guide` section answers each rarer question, so the skill does not copy this reference.
 
 If you are writing an agent that has been asked to orchestrate subagents, the bundled skill helps it behave correctly without guessing the patterns. If you are a human user, you do not need to read it; the README and prompt shortcuts encode the same workflows in user-facing form.

@@ -42,9 +42,10 @@ export interface FakeChildResponse {
 	structuredOutput?: unknown;
 	runtimeAcknowledgedExtensions?: unknown;
 	missingTools?: string[];
+	/** Records the diagnostic of an extension that left these allowlisted tools out of the request; pair it with an aborted reply. */
+	undeclaredTools?: string[];
 	/** Rejects the session creation itself (a startup failure). */
 	createError?: string;
-	/** Keeps the run open until the parent aborts it. */
 	hangUntilAbort?: boolean;
 	/** After draining a post-final steer/follow-up into pending (hasQueuedMessages false), delay before `turn_start`. */
 	queuedMessageTurnStartDelayMs?: number;
@@ -70,7 +71,6 @@ export interface FakeChildSessionRecord {
 export interface FakeChildSessions {
 	readonly sessions: FakeChildSessionRecord[];
 	readonly factory: ChildSessionFactory;
-	readonly disposeCalls: number;
 	reset(): void;
 }
 
@@ -215,7 +215,6 @@ function reportedModel(model: string | undefined): string | undefined {
 
 export function createFakeChildSessions(queueDir: () => string): FakeChildSessions {
 	const sessions: FakeChildSessionRecord[] = [];
-	let disposeCalls = 0;
 	const factory: ChildSessionFactory = {
 		async create(launch) {
 			const record: FakeChildSessionRecord = { launch, task: undefined, steers: [], aborted: false, disposed: false, settled: false, scriptedFinalEmitted: false };
@@ -326,7 +325,9 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 			};
 			const waitForReleasePath = async (releasePath: string | undefined): Promise<void> => {
 				if (typeof releasePath !== "string") return;
-				const deadline = Date.now() + 30_000;
+				// Release is a test-controlled event and abort short-circuits below; this bound only prevents an endless wait,
+				// so it must stay clear of pre-release phases that spawn several cold `node --experimental-strip-types` children.
+				const deadline = Date.now() + 120_000;
 				while (!fs.existsSync(releasePath)) {
 					if (record.aborted) return;
 					if (Date.now() >= deadline) throw new Error(`Timed out waiting for mock release path: ${releasePath}`);
@@ -367,6 +368,17 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 					}
 				}
 				emit({ type: "agent_start" });
+				if (Array.isArray(response.undeclaredTools) && response.undeclaredTools.length > 0) {
+					const required = launch.runtime.requiredTools ?? [];
+					launch.runtime.toolDiagnostic?.({
+						...(launch.runtime.agent ? { agent: launch.runtime.agent } : {}),
+						required,
+						available: required,
+						missing: [],
+						undeclared: response.undeclaredTools.filter((name) => required.includes(name)),
+						uncallable: ["fabric_exec"],
+					});
+				}
 				if (response.queuedInputReleasePath) {
 					boundaryOpen = true;
 					const keepAlive = setInterval(() => {}, 1_000);
@@ -515,20 +527,24 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 			return session;
 		},
 		async dispose() {
-			disposeCalls += 1;
-			for (const record of sessions) {
-				if (record.session?.detached) continue;
-				if (record.session) record.session.shutDown = true;
-				await record.session?.abort();
-				record.aborted = true;
-				record.disposed = true;
-			}
+			await disposeMatching(() => true);
+		},
+		async disposeForParent(parentSessionFile) {
+			await disposeMatching((launch) => launch.parentSessionFile === parentSessionFile);
 		},
 	};
+	async function disposeMatching(matches: (launch: ChildSessionLaunch) => boolean): Promise<void> {
+		for (const record of sessions) {
+			if (record.session?.detached || !matches(record.launch)) continue;
+			if (record.session) record.session.shutDown = true;
+			await record.session?.abort();
+			record.aborted = true;
+			record.disposed = true;
+		}
+	}
 	return {
 		sessions,
 		factory,
-		get disposeCalls() { return disposeCalls; },
 		reset() { sessions.length = 0; },
 	};
 }
